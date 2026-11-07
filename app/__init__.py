@@ -1,0 +1,1 @@
+"""HookWatch application package."""
