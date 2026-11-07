@@ -14,16 +14,18 @@ so it will not appear in a fresh clone of this repository.
 
 ## Status
 
-Stage 1 (webhook data contract) is complete. The application starts, serves a
+Stage 2 (webhook simulator) is complete. The application starts, serves a
 health check and validates webhook event envelopes against a tested Pydantic
-model. Nothing receives or stores events yet. Stages are implemented one at a
-time, and each stage is committed separately.
+model. A development tool can send simulated events to any URL and report the
+response, but the application still has no receiver endpoint, so simulated
+events currently receive a 404. Stages are implemented one at a time, and each
+stage is committed separately.
 
 | Stage | Scope | Status |
 | --- | --- | --- |
 | 0 | Repository inspection and project initialization | Complete |
 | 1 | Webhook data contract | Complete |
-| 2 | Webhook simulator | Not started |
+| 2 | Webhook simulator | Complete |
 | 3 | Webhook receiver | Not started |
 | 4 | Persistence | Not started |
 | 5 | Event lifecycle and idempotency | Not started |
@@ -58,6 +60,51 @@ uv run uvicorn app.main:app --reload
 
 - Health check: http://127.0.0.1:8000/health
 - Interactive API documentation: http://127.0.0.1:8000/docs
+
+## Webhook simulator
+
+`tools/simulate_webhook.py` is a development tool that posts events to a
+running instance. It builds each event through the same `WebhookEvent` contract
+the application uses, so it cannot send a malformed envelope, and it prints the
+status code and response body so failures can be inspected.
+
+```shell
+uv run python -m tools.simulate_webhook
+uv run python -m tools.simulate_webhook --event-type user.created --count 3
+uv run python -m tools.simulate_webhook --data '{"amount": 500, "currency": "USD"}'
+uv run python -m tools.simulate_webhook --event-id evt_fixed --count 2
+uv run python -m tools.simulate_webhook --raw '{"event_id": "", "event_type": "x"}'
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--url` | `http://127.0.0.1:8000/webhooks/simulator` | Target URL. |
+| `--event-type` | `simulator.ping` | Event type to send. |
+| `--data` | `{}` | JSON object used as the event data. |
+| `--raw` | none | Sends this JSON exactly as given, bypassing contract validation. |
+| `--event-id` | generated per delivery | Fixed id reused for every delivery. |
+| `--count` | `1` | Number of deliveries. |
+| `--timeout` | `5.0` | Request timeout in seconds. |
+
+Without `--raw`, the tool refuses to send anything the contract would reject,
+so every simulated delivery is a valid one. `--raw` exists for the opposite
+case: sending a broken payload on purpose to check that the receiver rejects it
+with a meaningful response.
+
+Exit codes: `0` when every delivery returned a 2xx response, `1` when a
+delivery failed or could not be sent, `2` when the arguments or the generated
+event were invalid.
+
+This is expected to fail against the application today: the receiver endpoint
+arrives in Stage 3, so requests to `/webhooks/...` return `404 Not Found` and the
+tool exits with `1`. Against any server that answers 2xx it exits with `0`.
+
+Sending the same `--event-id` more than once delivers the same event repeatedly,
+which is how duplicate deliveries will be exercised once duplicate detection
+exists.
+
+The simulator relies on development dependencies, which `uv run` installs by
+default.
 
 ## Tests
 
@@ -112,7 +159,10 @@ Behaviour worth knowing:
 |       `-- event.py      WebhookEvent data contract
 |-- tests/
 |   |-- test_health.py         Health endpoint test
-|   `-- test_event_schema.py   Event contract validation tests
+|   |-- test_event_schema.py   Event contract validation tests
+|   `-- test_simulator.py      Webhook simulator tests
+|-- tools/
+|   `-- simulate_webhook.py    Development tool that sends simulated events
 |-- pyproject.toml        Project metadata, dependencies, pytest configuration
 |-- uv.lock               Reproducible dependency lock file
 |-- .python-version       Python version selected by uv
