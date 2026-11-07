@@ -23,6 +23,9 @@ __pycache__/
 .env.*
 !.env.example
 
+# Local development notes and specifications
+hookwatch_implementation.md
+
 # Coverage and test output
 .coverage
 htmlcov/

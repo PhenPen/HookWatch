@@ -8,8 +8,9 @@ recovered. The same application services will eventually be exposed to AI
 agents through an MCP server, without duplicating business logic between the
 HTTP API and the MCP layer.
 
-The authoritative specification and staged roadmap live in
-[hookwatch_implementation.md](hookwatch_implementation.md).
+The authoritative specification and staged roadmap are kept in a local
+`hookwatch_implementation.md` document. It is intentionally not tracked in Git,
+so it will not appear in a fresh clone of this repository.
 
 ## Status
 
