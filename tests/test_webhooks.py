@@ -1,11 +1,8 @@
 import logging
-from collections.abc import Iterator
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-
-from app.main import app
 
 VALID_EVENT: dict[str, Any] = {
     "event_id": "evt_123",
@@ -13,12 +10,6 @@ VALID_EVENT: dict[str, Any] = {
     "occurred_at": "2026-11-07T12:00:00Z",
     "data": {"amount": 500, "currency": "USD"},
 }
-
-
-@pytest.fixture
-def client() -> Iterator[TestClient]:
-    with TestClient(app) as test_client:
-        yield test_client
 
 
 def test_accepts_a_valid_event(client: TestClient) -> None:

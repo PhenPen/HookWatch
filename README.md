@@ -14,11 +14,12 @@ so it will not appear in a fresh clone of this repository.
 
 ## Status
 
-Stage 3 (webhook receiver) is complete. The application starts, serves a health
-check, validates webhook event envelopes and accepts them at
-`POST /webhooks/{source}`. Accepted events are logged and then discarded,
-because nothing is stored yet. Stages are implemented one at a time, and each
-stage is committed separately.
+Stage 4 (persistence) is complete. The application starts, serves a health
+check, validates webhook event envelopes, accepts them at
+`POST /webhooks/{source}` and stores them in SQLite before responding, so
+events survive a restart. Processing, duplicate detection and inspection over
+HTTP do not exist yet. Stages are implemented one at a time, and each stage is
+committed separately.
 
 | Stage | Scope | Status |
 | --- | --- | --- |
@@ -26,7 +27,7 @@ stage is committed separately.
 | 1 | Webhook data contract | Complete |
 | 2 | Webhook simulator | Complete |
 | 3 | Webhook receiver | Complete |
-| 4 | Persistence | Not started |
+| 4 | Persistence | Complete |
 | 5 | Event lifecycle and idempotency | Not started |
 | 6 | Processing engine | Not started |
 | 7 | Monitoring and event replay | Not started |
@@ -60,6 +61,9 @@ uv run uvicorn app.main:app --reload
 - Health check: http://127.0.0.1:8000/health
 - Interactive API documentation: http://127.0.0.1:8000/docs
 
+The first start creates `hookwatch.db` in the working directory. See Storage
+below for its location, contents and how to inspect it.
+
 ## Receiving webhooks
 
 `POST /webhooks/{source}` accepts one event. The `{source}` segment names the
@@ -78,15 +82,16 @@ On success it answers `202 Accepted`:
 {"status": "accepted", "source": "github", "event_id": "evt_1"}
 ```
 
-`202` rather than `200` is deliberate: the event has been received and accepted,
-but it is not processed yet. Returning `200` would imply the work is finished.
+`202` rather than `200` is deliberate: the event has been received, validated and
+stored, but it is not processed yet. Returning `200` would imply the work is
+finished.
 
 The `source` segment accepts 1 to 64 characters from letters, digits, dot, dash
 and underscore.
 
 | Status | Meaning |
 | --- | --- |
-| `202` | The event is valid and accepted. Nothing is stored yet. |
+| `202` | The event is valid, stored, and accepted. Processing does not exist yet. |
 | `404` | No route matched, for example `POST /webhooks` with no source segment. |
 | `405` | The method is not allowed, for example `GET /webhooks/github`. |
 | `422` | The body or the source segment failed validation. The response body lists every offending field. |
@@ -100,6 +105,66 @@ WARNING:app.api.webhooks:request rejected path=/webhooks/github fields=[('body',
 
 Requests are not authenticated and carry no signature. Anything that matches the
 schema is accepted, which is a known gap until the security work.
+
+## Storage
+
+Accepted events are written to a SQLite database before the response is sent,
+so a `202` means "stored", not merely "received". The database file is created
+on first startup.
+
+- Default location: `hookwatch.db` in the working directory.
+- Override with the `HOOKWATCH_DB_PATH` environment variable. It is read once at
+  startup, so changing it requires a restart.
+- The file is excluded from Git by the `*.db` rule.
+
+The `events` table:
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `id` | integer | Internal row key, assigned by the database. |
+| `source` | text | The `{source}` path segment the event arrived on. |
+| `event_id` | text | The identifier the sender supplied. Not unique yet. |
+| `event_type` | text | Provider-defined event name. |
+| `occurred_at` | text | When the sender says it happened, normalised to UTC. |
+| `data` | text | The payload as JSON. |
+| `received_at` | text | When HookWatch stored it, normalised to UTC. |
+
+Timestamps are stored as ISO 8601 text in UTC. SQLite has no datetime type, and
+text in this fixed format sorts correctly. Offsets are converted to UTC first,
+because mixing `+01:00` and `Z` values in text comparison produces the wrong
+order.
+
+Inspect what was stored:
+
+```shell
+uv run python -m tools.inspect_events
+uv run python -m tools.inspect_events --limit 5
+uv run python -m tools.inspect_events --db C:\temp\other.db
+```
+
+It prints one JSON object per line, newest first:
+
+```json
+{"id": 2, "source": "github", "event_id": "evt_...", "event_type": "invoice.paid", "occurred_at": "2026-11-08T08:24:54+00:00", "received_at": "2026-11-08T08:24:54+00:00", "data": {}}
+```
+
+If the `sqlite3` command line tool is installed, the same data is available
+directly:
+
+```shell
+sqlite3 hookwatch.db "SELECT id, source, event_type, received_at FROM events ORDER BY id DESC LIMIT 5;"
+```
+
+Known limits at this stage:
+
+- The schema is created with `CREATE TABLE IF NOT EXISTS` at startup. There is
+  no migration tool. That works for creating a table, but cannot alter one, so
+  the first schema change will need its own decision.
+- There is no unique constraint on `source` and `event_id`. A redelivered event
+  is stored again as a new row. Duplicate detection is the next stage.
+- The table grows forever. There is no retention, archival or cleanup.
+- SQL access is confined to `app/repositories/`. Routes never see SQL, so
+  replacing SQLite later means rewriting one class.
 
 ## Webhook simulator
 
@@ -195,18 +260,28 @@ Behaviour worth knowing:
 |   |-- __init__.py
 |   |-- api/
 |   |   |-- __init__.py
+|   |   |-- deps.py       Shared route dependencies
 |   |   `-- webhooks.py   Webhook receiver endpoint and error logging
-|   |-- main.py           FastAPI application, router and logging setup
+|   |-- db.py             SQLite connection, schema and stored event model
+|   |-- main.py           App factory, router and logging setup
+|   |-- repositories/
+|   |   |-- __init__.py
+|   |   `-- events.py     EventRepository, the only place with event SQL
 |   `-- schemas/
 |       |-- __init__.py
 |       `-- event.py      WebhookEvent data contract
 |-- tests/
+|   |-- conftest.py            Shared app and client fixtures on a temp database
 |   |-- test_health.py         Health endpoint test
 |   |-- test_event_schema.py   Event contract validation tests
 |   |-- test_simulator.py      Webhook simulator tests
-|   `-- test_webhooks.py       Receiver API tests
+|   |-- test_webhooks.py       Receiver API tests
+|   |-- test_events_repository.py  Repository tests
+|   |-- test_persistence.py    API to database tests and restart behaviour
+|   `-- test_inspect_events.py Inspector tool tests
 |-- tools/
-|   `-- simulate_webhook.py    Development tool that sends simulated events
+|   |-- simulate_webhook.py    Development tool that sends simulated events
+|   `-- inspect_events.py      Development tool that prints stored events
 |-- pyproject.toml        Project metadata, dependencies, pytest configuration
 |-- uv.lock               Reproducible dependency lock file
 |-- .python-version       Python version selected by uv
@@ -218,18 +293,23 @@ persistence and MCP will be added when a stage needs them, not in advance.
 
 ## Configuration
 
-No configuration is required yet. HookWatch does not read environment
-variables, connect to a database or hold any secrets at this stage.
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HOOKWATCH_DB_PATH` | `hookwatch.db` | SQLite database file. Read once at startup. |
+
+Nothing else is configurable yet. There are no secrets and no authentication.
 
 ## Not implemented yet
 
 These are planned but deliberately absent, so nothing here should be assumed to
 exist:
 
-- Any database or persistence layer. Accepted events are logged and discarded.
-- Automatic database schema migrations
-- Duplicate detection and idempotent processing
+- Duplicate detection and idempotent processing. Redeliveries are stored again.
+- Automatic database schema migrations. The schema is created once with
+  `CREATE TABLE IF NOT EXISTS`.
 - Background processing, retries or dead-letter handling
+- Event inspection over HTTP. Use `tools/inspect_events.py` until then.
 - Signature verification, rate limiting or authentication
 - Payload size limits at the HTTP layer
+- Retention, archival or cleanup of stored events
 - MCP tools and resources

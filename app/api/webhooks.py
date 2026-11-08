@@ -3,10 +3,12 @@
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Path, Request, Response, status
+from fastapi import APIRouter, Depends, Path, Request, Response, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 
+from app.api.deps import get_event_repository
+from app.repositories.events import EventRepository
 from app.schemas.event import WebhookEvent
 
 logger = logging.getLogger(__name__)
@@ -28,22 +30,28 @@ SourceName = Annotated[
 
 
 @router.post("/webhooks/{source}", status_code=status.HTTP_202_ACCEPTED)
-def receive_webhook(source: SourceName, event: WebhookEvent) -> dict[str, str]:
-    """Accept one webhook event.
+def receive_webhook(
+    source: SourceName,
+    event: WebhookEvent,
+    repository: Annotated[EventRepository, Depends(get_event_repository)],
+) -> dict[str, str]:
+    """Accept one webhook event and store it.
 
     Validation happens before this function runs. FastAPI parses the body into
     a WebhookEvent and returns 422 without calling us if anything is wrong, so
     by this point the event is known to satisfy the contract.
 
-    Nothing is stored yet: a valid event is logged and then discarded. Storage
-    arrives in Stage 4, so a successful response means "received and accepted",
-    not "processed".
+    The event is written to the database before the response is sent, so a 202
+    means "stored", not merely "received". Processing still does not exist;
+    that arrives in a later stage.
     """
+    record_id = repository.add(source, event)
     logger.info(
-        "webhook accepted source=%s event_id=%s event_type=%s",
+        "webhook accepted source=%s event_id=%s event_type=%s row=%s",
         source,
         event.event_id,
         event.event_type,
+        record_id,
     )
     return {"status": "accepted", "source": source, "event_id": event.event_id}
 
