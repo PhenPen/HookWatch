@@ -14,11 +14,10 @@ so it will not appear in a fresh clone of this repository.
 
 ## Status
 
-Stage 2 (webhook simulator) is complete. The application starts, serves a
-health check and validates webhook event envelopes against a tested Pydantic
-model. A development tool can send simulated events to any URL and report the
-response, but the application still has no receiver endpoint, so simulated
-events currently receive a 404. Stages are implemented one at a time, and each
+Stage 3 (webhook receiver) is complete. The application starts, serves a health
+check, validates webhook event envelopes and accepts them at
+`POST /webhooks/{source}`. Accepted events are logged and then discarded,
+because nothing is stored yet. Stages are implemented one at a time, and each
 stage is committed separately.
 
 | Stage | Scope | Status |
@@ -26,7 +25,7 @@ stage is committed separately.
 | 0 | Repository inspection and project initialization | Complete |
 | 1 | Webhook data contract | Complete |
 | 2 | Webhook simulator | Complete |
-| 3 | Webhook receiver | Not started |
+| 3 | Webhook receiver | Complete |
 | 4 | Persistence | Not started |
 | 5 | Event lifecycle and idempotency | Not started |
 | 6 | Processing engine | Not started |
@@ -60,6 +59,47 @@ uv run uvicorn app.main:app --reload
 
 - Health check: http://127.0.0.1:8000/health
 - Interactive API documentation: http://127.0.0.1:8000/docs
+
+## Receiving webhooks
+
+`POST /webhooks/{source}` accepts one event. The `{source}` segment names the
+sending service and lives in the URL, not the body, so an event from GitHub is
+posted to `/webhooks/github`.
+
+```shell
+curl -i -X POST http://127.0.0.1:8000/webhooks/github \
+  -H "Content-Type: application/json" \
+  -d '{"event_id":"evt_1","event_type":"invoice.paid","occurred_at":"2026-11-07T12:00:00Z","data":{"amount":500}}'
+```
+
+On success it answers `202 Accepted`:
+
+```json
+{"status": "accepted", "source": "github", "event_id": "evt_1"}
+```
+
+`202` rather than `200` is deliberate: the event has been received and accepted,
+but it is not processed yet. Returning `200` would imply the work is finished.
+
+The `source` segment accepts 1 to 64 characters from letters, digits, dot, dash
+and underscore.
+
+| Status | Meaning |
+| --- | --- |
+| `202` | The event is valid and accepted. Nothing is stored yet. |
+| `404` | No route matched, for example `POST /webhooks` with no source segment. |
+| `405` | The method is not allowed, for example `GET /webhooks/github`. |
+| `422` | The body or the source segment failed validation. The response body lists every offending field. |
+
+Accepted and rejected requests are both logged:
+
+```text
+INFO:app.api.webhooks:webhook accepted source=github event_id=evt_1 event_type=invoice.paid
+WARNING:app.api.webhooks:request rejected path=/webhooks/github fields=[('body', 'event_id')]
+```
+
+Requests are not authenticated and carry no signature. Anything that matches the
+schema is accepted, which is a known gap until the security work.
 
 ## Webhook simulator
 
@@ -95,9 +135,9 @@ Exit codes: `0` when every delivery returned a 2xx response, `1` when a
 delivery failed or could not be sent, `2` when the arguments or the generated
 event were invalid.
 
-This is expected to fail against the application today: the receiver endpoint
-arrives in Stage 3, so requests to `/webhooks/...` return `404 Not Found` and the
-tool exits with `1`. Against any server that answers 2xx it exits with `0`.
+Against a running HookWatch instance the default URL targets the receiver above,
+so a valid delivery returns `202` and the tool exits `0`. Use `--raw` to send a
+broken payload and watch the receiver reject it with `422`.
 
 Sending the same `--event-id` more than once delivers the same event repeatedly,
 which is how duplicate deliveries will be exercised once duplicate detection
@@ -153,14 +193,18 @@ Behaviour worth knowing:
 .
 |-- app/
 |   |-- __init__.py
-|   |-- main.py           FastAPI application and routes
+|   |-- api/
+|   |   |-- __init__.py
+|   |   `-- webhooks.py   Webhook receiver endpoint and error logging
+|   |-- main.py           FastAPI application, router and logging setup
 |   `-- schemas/
 |       |-- __init__.py
 |       `-- event.py      WebhookEvent data contract
 |-- tests/
 |   |-- test_health.py         Health endpoint test
 |   |-- test_event_schema.py   Event contract validation tests
-|   `-- test_simulator.py      Webhook simulator tests
+|   |-- test_simulator.py      Webhook simulator tests
+|   `-- test_webhooks.py       Receiver API tests
 |-- tools/
 |   `-- simulate_webhook.py    Development tool that sends simulated events
 |-- pyproject.toml        Project metadata, dependencies, pytest configuration
@@ -182,9 +226,10 @@ variables, connect to a database or hold any secrets at this stage.
 These are planned but deliberately absent, so nothing here should be assumed to
 exist:
 
-- Webhook receiver endpoints
-- Any database or persistence layer
+- Any database or persistence layer. Accepted events are logged and discarded.
 - Automatic database schema migrations
+- Duplicate detection and idempotent processing
 - Background processing, retries or dead-letter handling
 - Signature verification, rate limiting or authentication
+- Payload size limits at the HTTP layer
 - MCP tools and resources
