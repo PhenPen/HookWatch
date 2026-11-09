@@ -15,8 +15,18 @@ __pycache__/
 *.db-journal
 *.db-wal
 *.db-shm
+*.db.*
 *.sqlite
+*.sqlite-*
 *.sqlite3
+*.bak
+
+# Logs and coverage reports
+*.log
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
 # Environment and secrets
 .env
@@ -26,12 +36,9 @@ __pycache__/
 # Local development notes and specifications
 hookwatch_implementation.md
 
-# Coverage and test output
-.coverage
-htmlcov/
-
 # Editor and OS files
 .vscode/
 .idea/
 Thumbs.db
 desktop.ini
+.DS_Store
