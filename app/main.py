@@ -5,6 +5,7 @@ Run locally with:
     uv run uvicorn app.main:app --reload
 """
 
+import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -17,7 +18,9 @@ from fastapi.exceptions import RequestValidationError
 from app.api.webhooks import log_validation_error
 from app.api.webhooks import router as webhooks_router
 from app.db import migrate
+from app.engine import run_forever
 from app.repositories.events import EventRepository
+from app.services.events import EventService, ProcessingSettings
 
 # uvicorn configures only its own loggers, so without this the application's
 # INFO messages would be dropped silently. Structured logging is left to the
@@ -29,24 +32,50 @@ logger = logging.getLogger(__name__)
 DEFAULT_DATABASE_PATH = Path("hookwatch.db")
 
 
-def create_app(database_path: Path | None = None) -> FastAPI:
+def create_app(
+    database_path: Path | None = None,
+    *,
+    start_engine: bool = True,
+    settings: ProcessingSettings | None = None,
+) -> FastAPI:
     """Build the application.
 
     The database path is a parameter so tests can use a temporary file and never
     touch the development database. The module level app below is the normal
     entry point for uvicorn.
+
+    Tests that inspect stored rows set start_engine to False. Otherwise the
+    background loop would process events while a test is asserting on their
+    initial received state.
     """
     path = database_path or Path(
         os.environ.get("HOOKWATCH_DB_PATH", str(DEFAULT_DATABASE_PATH))
     )
+    processing_settings = settings or ProcessingSettings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         applied = migrate(path)
         if applied:
             logger.info("applied %s database migration(s) to %s", applied, path)
-        app.state.events = EventRepository(path)
-        yield
+
+        repository = EventRepository(path)
+        service = EventService(repository, settings=processing_settings)
+        app.state.events = repository
+        app.state.event_service = service
+        app.state.settings = processing_settings
+
+        stop = asyncio.Event()
+        engine_task: asyncio.Task[None] | None = None
+        if start_engine:
+            engine_task = asyncio.create_task(run_forever(service, stop))
+
+        try:
+            yield
+        finally:
+            stop.set()
+            if engine_task is not None:
+                await engine_task
 
     app = FastAPI(title="HookWatch", lifespan=lifespan)
 

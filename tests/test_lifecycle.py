@@ -8,6 +8,7 @@ from app.lifecycle import (
     AttemptNotOpenError,
     AttemptOutcome,
     EventStatus,
+    FailureKind,
     InvalidTransitionError,
 )
 from app.repositories.events import EventRepository
@@ -109,6 +110,7 @@ def test_finish_processing_failure_moves_to_failed(
     assert stored.status is EventStatus.FAILED
     assert attempt is not None
     assert attempt.outcome is AttemptOutcome.FAILED
+    assert attempt.failure_kind is FailureKind.RETRYABLE
     assert attempt.error == "timeout"
 
 
@@ -161,3 +163,44 @@ def test_a_retry_can_succeed(service: EventService) -> None:
         AttemptOutcome.FAILED,
         AttemptOutcome.SUCCEEDED,
     ]
+
+
+def test_permanent_failure_can_be_dead_lettered(service: EventService) -> None:
+    result = service.record_delivery("github", make_event())
+    attempt_id = service.start_processing(result.record_id)
+
+    service.finish_processing(
+        attempt_id,
+        succeeded=False,
+        error="payload cannot be processed",
+        failure_kind=FailureKind.PERMANENT,
+        dead_letter=True,
+    )
+
+    stored = service.repository.get(result.record_id)
+    attempt = service.repository.get_attempt(attempt_id)
+    assert stored is not None
+    assert stored.status is EventStatus.FAILED
+    assert stored.dead_lettered_at is not None
+    assert attempt is not None
+    assert attempt.failure_kind is FailureKind.PERMANENT
+
+    with pytest.raises(InvalidTransitionError):
+        service.start_processing(result.record_id)
+
+
+def test_start_processing_rejects_an_exhausted_event(
+    service: EventService,
+) -> None:
+    from app.services.events import ProcessingSettings
+
+    limited = EventService(
+        service.repository,
+        settings=ProcessingSettings(max_attempts=1),
+    )
+    result = limited.record_delivery("github", make_event())
+    attempt_id = limited.start_processing(result.record_id)
+    limited.finish_processing(attempt_id, succeeded=False, error="timeout")
+
+    with pytest.raises(InvalidTransitionError, match="exhausted"):
+        limited.start_processing(result.record_id)

@@ -1,11 +1,10 @@
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from app.db import Attempt, StoredEvent, migrate
-from app.lifecycle import AttemptOutcome, EventStatus
+from app.lifecycle import AttemptOutcome, EventStatus, FailureKind
 from app.repositories.events import EventRepository
 from app.schemas.event import WebhookEvent
 
@@ -75,6 +74,7 @@ def test_get_returns_the_stored_event(repository: EventRepository) -> None:
     assert stored.occurred_at == OCCURRED_AT
     assert stored.data == {"amount": 500}
     assert stored.status is EventStatus.RECEIVED
+    assert stored.dead_lettered_at is None
 
 
 def test_get_returns_none_for_an_unknown_id(repository: EventRepository) -> None:
@@ -172,12 +172,33 @@ def test_events_survive_a_new_repository_instance(database_path: Path) -> None:
     assert second.get(record_id) is not None
 
 
-def test_begin_attempt_marks_the_event_processing(
+def test_list_pending_returns_received_and_retryable_failed(
     repository: EventRepository,
 ) -> None:
+    received_id, _ = repository.insert_if_new("github", make_event("evt_received"))
+    failed_id, _ = repository.insert_if_new("github", make_event("evt_failed"))
+    dead_id, _ = repository.insert_if_new("github", make_event("evt_dead"))
+
+    attempt_id = repository.claim(failed_id)
+    assert attempt_id is not None
+    repository.complete_attempt(
+        attempt_id,
+        event_status=EventStatus.FAILED,
+        outcome=AttemptOutcome.FAILED,
+        error="timeout",
+        failure_kind=FailureKind.RETRYABLE,
+    )
+    repository.mark_dead_letter(dead_id)
+
+    pending = repository.list_pending()
+
+    assert [event.id for event in pending] == [received_id, failed_id]
+
+
+def test_claim_marks_the_event_processing(repository: EventRepository) -> None:
     record_id, _ = repository.insert_if_new("github", make_event())
 
-    attempt_id = repository.begin_attempt(record_id)
+    attempt_id = repository.claim(record_id)
 
     attempt = repository.get_attempt(attempt_id)
     stored = repository.get(record_id)
@@ -189,26 +210,55 @@ def test_begin_attempt_marks_the_event_processing(
     assert stored.status is EventStatus.PROCESSING
 
 
+def test_claim_is_refused_when_the_event_is_already_processing(
+    repository: EventRepository,
+) -> None:
+    record_id, _ = repository.insert_if_new("github", make_event())
+    first_attempt = repository.claim(record_id)
+
+    second_attempt = repository.claim(record_id)
+
+    assert first_attempt is not None
+    assert second_attempt is None
+
+
+def test_claim_is_refused_for_an_unknown_event(
+    repository: EventRepository,
+) -> None:
+    assert repository.claim(999) is None
+
+
+def test_claim_is_refused_for_a_dead_lettered_event(
+    repository: EventRepository,
+) -> None:
+    record_id, _ = repository.insert_if_new("github", make_event())
+    repository.mark_dead_letter(record_id)
+
+    assert repository.claim(record_id) is None
+
+
 def test_attempt_numbers_increase(repository: EventRepository) -> None:
     record_id, _ = repository.insert_if_new("github", make_event())
 
-    repository.begin_attempt(record_id)
-    repository.begin_attempt(record_id)
+    first_attempt = repository.claim(record_id)
+    assert first_attempt is not None
+    repository.complete_attempt(
+        first_attempt,
+        event_status=EventStatus.FAILED,
+        outcome=AttemptOutcome.FAILED,
+        failure_kind=FailureKind.RETRYABLE,
+    )
+    second_attempt = repository.claim(record_id)
 
     attempts = repository.list_attempts(record_id)
+    assert second_attempt is not None
     assert [attempt.attempt_number for attempt in attempts] == [1, 2]
-
-
-def test_attempts_are_rejected_for_an_unknown_event(
-    repository: EventRepository,
-) -> None:
-    with pytest.raises(sqlite3.IntegrityError):
-        repository.begin_attempt(999)
 
 
 def test_complete_attempt_success(repository: EventRepository) -> None:
     record_id, _ = repository.insert_if_new("github", make_event())
-    attempt_id = repository.begin_attempt(record_id)
+    attempt_id = repository.claim(record_id)
+    assert attempt_id is not None
 
     completed = repository.complete_attempt(
         attempt_id,
@@ -222,6 +272,7 @@ def test_complete_attempt_success(repository: EventRepository) -> None:
     assert attempt is not None
     assert attempt.outcome is AttemptOutcome.SUCCEEDED
     assert attempt.finished_at is not None
+    assert attempt.failure_kind is None
     assert attempt.error is None
     assert stored is not None
     assert stored.status is EventStatus.PROCESSED
@@ -231,26 +282,54 @@ def test_complete_attempt_failure_stores_the_error(
     repository: EventRepository,
 ) -> None:
     record_id, _ = repository.insert_if_new("github", make_event())
-    attempt_id = repository.begin_attempt(record_id)
+    attempt_id = repository.claim(record_id)
+    assert attempt_id is not None
 
     repository.complete_attempt(
         attempt_id,
         event_status=EventStatus.FAILED,
         outcome=AttemptOutcome.FAILED,
         error="connection refused",
+        failure_kind=FailureKind.RETRYABLE,
     )
 
     attempt = repository.get_attempt(attempt_id)
     assert isinstance(attempt, Attempt)
     assert attempt.outcome is AttemptOutcome.FAILED
+    assert attempt.failure_kind is FailureKind.RETRYABLE
     assert attempt.error == "connection refused"
+
+
+def test_complete_attempt_can_dead_letter(
+    repository: EventRepository,
+) -> None:
+    record_id, _ = repository.insert_if_new("github", make_event())
+    attempt_id = repository.claim(record_id)
+    assert attempt_id is not None
+    finished_at = datetime(2026, 11, 7, 12, 5, tzinfo=timezone.utc)
+
+    repository.complete_attempt(
+        attempt_id,
+        event_status=EventStatus.FAILED,
+        outcome=AttemptOutcome.FAILED,
+        error="bad payload",
+        failure_kind=FailureKind.PERMANENT,
+        dead_letter=True,
+        finished_at=finished_at,
+    )
+
+    stored = repository.get(record_id)
+    assert stored is not None
+    assert stored.status is EventStatus.FAILED
+    assert stored.dead_lettered_at == finished_at
 
 
 def test_completing_an_attempt_twice_is_refused(
     repository: EventRepository,
 ) -> None:
     record_id, _ = repository.insert_if_new("github", make_event())
-    attempt_id = repository.begin_attempt(record_id)
+    attempt_id = repository.claim(record_id)
+    assert attempt_id is not None
     repository.complete_attempt(
         attempt_id,
         event_status=EventStatus.PROCESSED,
@@ -264,6 +343,66 @@ def test_completing_an_attempt_twice_is_refused(
     )
 
     assert completed_again is False
+
+
+def test_mark_dead_letter_is_idempotent(repository: EventRepository) -> None:
+    record_id, _ = repository.insert_if_new("github", make_event())
+    at = datetime(2026, 11, 7, 12, 5, tzinfo=timezone.utc)
+
+    first = repository.mark_dead_letter(record_id, at=at)
+    second = repository.mark_dead_letter(record_id, at=at)
+
+    assert first is True
+    assert second is False
+
+
+def test_recover_abandoned_closes_an_open_attempt(
+    repository: EventRepository,
+) -> None:
+    record_id, _ = repository.insert_if_new("github", make_event())
+    started_at = datetime(2026, 11, 7, 11, 0, tzinfo=timezone.utc)
+    attempt_id = repository.claim(record_id, started_at=started_at)
+    assert attempt_id is not None
+    recovered_at = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
+
+    recovered = repository.recover_abandoned(
+        cutoff=recovered_at - timedelta(minutes=5),
+        recovered_at=recovered_at,
+    )
+
+    attempt = repository.get_attempt(attempt_id)
+    stored = repository.get(record_id)
+    assert recovered == 1
+    assert attempt is not None
+    assert attempt.finished_at == recovered_at
+    assert attempt.outcome is AttemptOutcome.FAILED
+    assert attempt.failure_kind is FailureKind.RETRYABLE
+    assert attempt.error is not None
+    assert "abandoned" in attempt.error
+    assert stored is not None
+    assert stored.status is EventStatus.FAILED
+
+
+def test_recover_abandoned_ignores_young_attempts(
+    repository: EventRepository,
+) -> None:
+    record_id, _ = repository.insert_if_new("github", make_event())
+    now = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
+    attempt_id = repository.claim(record_id, started_at=now)
+    assert attempt_id is not None
+
+    recovered = repository.recover_abandoned(
+        cutoff=now - timedelta(minutes=5),
+        recovered_at=now,
+    )
+
+    attempt = repository.get_attempt(attempt_id)
+    stored = repository.get(record_id)
+    assert recovered == 0
+    assert attempt is not None
+    assert attempt.finished_at is None
+    assert stored is not None
+    assert stored.status is EventStatus.PROCESSING
 
 
 def test_get_attempt_returns_none_for_an_unknown_id(

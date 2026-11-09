@@ -14,13 +14,15 @@ so it will not appear in a fresh clone of this repository.
 
 ## Status
 
-Stage 5 (event lifecycle and idempotency) is complete. The application starts,
-serves a health check, validates webhook event envelopes, accepts them at
+Stage 6 (processing engine) is complete. The application starts, serves a
+health check, validates webhook event envelopes, accepts them at
 `POST /webhooks/{source}` and stores them in SQLite before responding, so
 events survive a restart. A redelivered event is detected and acknowledged
-without creating a second row, and every event carries a lifecycle status.
-Processing, HTTP inspection and replay do not exist yet. Stages are implemented
-one at a time, and each stage is committed separately.
+without creating a second row, and every event carries a lifecycle status. An
+in-process engine processes stored events, retries temporary failures with
+exponential backoff, classifies permanent failures and dead-letters events that
+will not be retried. HTTP inspection and replay do not exist yet. Stages are
+implemented one at a time, and each stage is committed separately.
 
 | Stage | Scope | Status |
 | --- | --- | --- |
@@ -30,7 +32,7 @@ one at a time, and each stage is committed separately.
 | 3 | Webhook receiver | Complete |
 | 4 | Persistence | Complete |
 | 5 | Event lifecycle and idempotency | Complete |
-| 6 | Processing engine | Not started |
+| 6 | Processing engine | Complete |
 | 7 | Monitoring and event replay | Not started |
 | 8 | MCP server | Not started |
 | 9 | AI agent integration | Not started |
@@ -84,8 +86,8 @@ On success a new event is stored and answered with `202 Accepted`:
 ```
 
 `202` rather than `200` is deliberate: the event has been received, validated and
-stored, but it is not processed yet. Returning `200` would imply the work is
-finished.
+stored, and the background engine will process it shortly. The response does not
+wait for that work. Returning `200` would imply processing has finished.
 
 If the same `source` and `event_id` were already stored, nothing new is written
 and the delivery is answered with `200 OK`:
@@ -107,7 +109,7 @@ and underscore.
 
 | Status | Meaning |
 | --- | --- |
-| `202` | The event is new, valid, stored and accepted. Processing does not exist yet. |
+| `202` | The event is new, valid, stored and queued for processing. |
 | `200` | The event was already stored. Nothing new was written. |
 | `404` | No route matched, for example `POST /webhooks` with no source segment. |
 | `405` | The method is not allowed, for example `GET /webhooks/github`. |
@@ -147,6 +149,7 @@ The `events` table:
 | `data` | text | The payload as JSON. |
 | `received_at` | text | When HookWatch stored it, normalised to UTC. |
 | `status` | text | Lifecycle status: `received`, `processing`, `processed` or `failed`. |
+| `dead_lettered_at` | text | When the engine stopped retrying, or null while the event is still eligible. |
 
 A unique index on `(source, event_id)` is what enforces idempotency. The insert
 uses `ON CONFLICT (source, event_id) DO NOTHING` and then checks how many rows
@@ -164,11 +167,12 @@ The `attempts` table records one row per processing attempt:
 | `started_at` | text | When the attempt began, in UTC. |
 | `finished_at` | text | When it ended, or null while it is open. |
 | `outcome` | text | `succeeded`, `failed`, or null while it is open. |
+| `failure_kind` | text | `retryable`, `permanent`, or null while it is open or after success. |
 | `error` | text | The failure message, when there was one. |
 
 Attempts exist so retries leave a history rather than overwriting a single
-counter. The processing engine that creates them arrives in the next stage; the
-table and the rules around it exist now.
+counter. The processing engine writes one row per try and uses the count to
+apply the attempt limit.
 
 Timestamps are stored as ISO 8601 text in UTC. SQLite has no datetime type, and
 text in this fixed format sorts correctly. Offsets are converted to UTC first,
@@ -201,9 +205,16 @@ finished work. Finishing an attempt that is missing or already finished raises
 `AttemptNotOpenError`, so closing the same attempt twice is a detectable mistake
 rather than a silent overwrite.
 
-Ingestion only creates `received` events, so the HTTP API cannot trigger a status
-change yet. The service methods and their tests are in place for the processing
-engine in Stage 6.
+A failed attempt is classified as `retryable` or `permanent`:
+
+- A retryable failure leaves the event `failed` and eligible for another try.
+- A permanent failure, or a retryable failure that reaches the attempt limit,
+  sets `dead_lettered_at`. The event stays `failed`, but the engine stops
+  selecting it. The payload and every attempt remain in the database.
+
+The HTTP API only creates `received` events. The processing engine moves them
+through the rest of the lifecycle using the same `EventService` methods that the
+API uses.
 
 ### Migrations
 
@@ -219,6 +230,7 @@ version instead of half upgraded.
 | 1 | The original `events` table from Stage 4. |
 | 2 | Adds `status`, deduplicates any existing rows, then adds the unique index on `(source, event_id)`. |
 | 3 | Creates the `attempts` table. |
+| 4 | Adds `attempts.failure_kind`, `events.dead_lettered_at` and an index on `events.status`. |
 
 Version 2 deletes all but the oldest row of every duplicate `(source, event_id)`
 pair before creating the unique index, because SQLite refuses to create a unique
@@ -236,28 +248,130 @@ uv run python -m tools.inspect_events --db C:\temp\other.db
 It prints one JSON object per line, newest first:
 
 ```json
-{"id": 2, "source": "github", "event_id": "evt_...", "event_type": "invoice.paid", "occurred_at": "2026-11-08T08:24:54+00:00", "received_at": "2026-11-08T08:24:54+00:00", "status": "received", "data": {}}
+{"id": 2, "source": "github", "event_id": "evt_...", "event_type": "invoice.paid", "occurred_at": "2026-11-08T08:24:54+00:00", "received_at": "2026-11-08T08:24:54+00:00", "status": "processed", "dead_lettered_at": null, "data": {}}
 ```
 
 If the `sqlite3` command line tool is installed, the same data is available
 directly:
 
 ```shell
-sqlite3 hookwatch.db "SELECT id, source, event_id, status, received_at FROM events ORDER BY id DESC LIMIT 5;"
+sqlite3 hookwatch.db "SELECT id, source, event_id, status, dead_lettered_at, received_at FROM events ORDER BY id DESC LIMIT 5;"
 ```
 
 Known limits at this stage:
 
-- There is no processing engine yet, so every stored event stays `received` and
-  the `attempts` table is only exercised by tests.
-- Storing a delivery is one atomic statement, and opening or closing an attempt
-  is one transaction. A crash between opening and closing an attempt would,
-  however, leave an event `processing` with an open attempt. Recovering those is
-  part of the processing engine stage.
+- The engine runs inside the application process. Stopping the application also
+  stops processing; stored events resume when it starts again.
+- There is one engine task per process. Running several uvicorn workers would
+  start one each. Claiming is atomic, so events are not processed twice, but
+  there is no leader election or shared scheduling yet.
+- There is no HTTP inspection, dead-letter listing or replay. Use
+  `tools/inspect_events.py` to see the stored status and timestamps.
 - The tables grow forever. There is no retention, archival or cleanup.
 - SQL access is confined to `app/repositories/`. Routes and services never see a
   connection or a table name, so replacing SQLite later means rewriting one
   class.
+
+## Processing engine
+
+The engine is one asyncio task started during the FastAPI lifespan. It asks the
+service for a batch of due events, processes them, and sleeps only when nothing
+was due. HTTP requests never wait for this work.
+
+Why in-process: SQLite is local, the database is already the queue, and the
+roadmap excludes Celery, Redis and brokers until a demonstrated need exists. A
+task in the lifespan is the smallest architecture that keeps webhook responses
+fast and survives a restart with pending work still in the database.
+
+The default processor logs the event and succeeds. Stage 6 exercises the
+scheduling, retry and dead-letter mechanics without a real third-party
+integration. A real processor can be injected into `EventService` without
+changing the engine.
+
+Processing is at-least-once. If the process dies after the side effect but
+before the attempt is closed, recovery will retry the event and the side effect
+can happen again. A real processor should therefore be safe to repeat, or use
+the event id as its own idempotency key.
+
+### Claiming work
+
+Before processing, the engine claims an event with a conditional update:
+
+```text
+UPDATE events SET status = 'processing'
+WHERE id = ? AND status IN ('received', 'failed') AND dead_lettered_at IS NULL
+```
+
+A changed row count of 1 means this worker owns the event. 0 means another
+worker won, or the event is not eligible, so the worker skips it. The status
+change and the new `attempts` row happen in one transaction, so an event cannot
+be processing with no attempt recorded.
+
+The database decides the race under its own lock. Two workers cannot both claim
+the same event.
+
+### Retries and backoff
+
+A retryable failure closes the attempt as `failed`, leaves `dead_lettered_at`
+null, and lets a later batch try again. An event is due when the attempt count is
+below the limit and enough time has passed since the last attempt:
+
+```text
+delay = min(backoff_base_seconds * 2^(attempts_so_far - 1), backoff_cap_seconds)
+```
+
+With the defaults that is 2, 4, 8, 16, 32 and then 60 seconds. The attempt count
+and finish time come from the existing `attempts` table, so no extra retry
+counter column is needed.
+
+### Failure classification
+
+The processor can signal what kind of failure happened:
+
+| Signal | Meaning | Result |
+| --- | --- | --- |
+| `RetryableProcessingError` | Temporary, such as a timeout or 503 | Event stays `failed` and is retried with backoff |
+| `PermanentProcessingError` | Cannot succeed, such as a malformed payload | Event is dead-lettered immediately |
+| Any other exception | Unexpected bug | Logged with a traceback, treated as retryable, still bounded by the attempt limit |
+
+Treating an unknown exception as retryable is deliberate. Dead-lettering on the
+first unexpected error would discard an event that a later fix might process. The
+attempt limit still stops an event that always crashes.
+
+### Dead letters
+
+An event is dead-lettered when a permanent failure occurs, or when the attempt
+limit is reached. The attempt is closed, the error is stored, `dead_lettered_at`
+is set, and the engine stops selecting the event. Nothing is deleted: the payload
+and the full attempt history remain available for investigation.
+
+A dead-lettered event keeps the `failed` status. `dead_lettered_at` is what
+distinguishes "failed, will retry" from "failed, given up".
+
+### Crash recovery
+
+An open attempt is a lease. If the process dies after claiming an event, the
+attempt keeps `finished_at` null and the event stays `processing` forever.
+
+Before each batch the engine looks for open attempts whose `started_at` is older
+than `stale_after_seconds`. It closes them as failed with an `abandoned` error
+and moves their events to `failed`, so the normal retry path takes over. The
+abandoned attempt counts toward the limit, because a crash is a failed attempt.
+
+### Settings
+
+Processing settings are code defaults in `app/services/events.py`, not
+environment variables yet. Configuration for deployment belongs to a later
+stage.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `poll_interval_seconds` | `1.0` | Sleep when a batch had no due work. |
+| `batch_size` | `10` | Maximum events examined in one call. |
+| `max_attempts` | `5` | Attempts before an event is dead-lettered. |
+| `backoff_base_seconds` | `2.0` | Wait after the first failure. |
+| `backoff_cap_seconds` | `60.0` | Largest wait between attempts. |
+| `stale_after_seconds` | `300.0` | Age at which an open attempt is treated as abandoned. |
 
 ## Webhook simulator
 
@@ -299,12 +413,16 @@ with status `duplicate`, which is still a 2xx response and also exits `0`. Use
 `--raw` to send a broken payload and watch the receiver reject it with `422`.
 
 Sending the same `--event-id` more than once delivers the same event repeatedly.
-That now exercises idempotency: the first delivery is stored and answered with
+That exercises idempotency: the first delivery is stored and answered with
 `202`, every later one is answered with `200` and no second row is written.
 
 ```shell
 uv run python -m tools.simulate_webhook --event-id evt_fixed --count 2
 ```
+
+The response describes acceptance, not processing. A stored event is usually
+picked up by the engine within a second, so `tools.inspect_events.py` may already
+show it as `processed` or `failed` by the time you look.
 
 The simulator relies on development dependencies, which `uv run` installs by
 default.
@@ -314,6 +432,11 @@ default.
 ```shell
 uv run pytest
 ```
+
+The API test fixtures disable the background engine with
+`create_app(..., start_engine=False)`, so assertions about the initial `received`
+state are deterministic. Engine tests start it explicitly or drive the service
+directly.
 
 ## Event data contract
 
@@ -361,8 +484,9 @@ Behaviour worth knowing:
 |   |   |-- deps.py       Shared route dependencies
 |   |   `-- webhooks.py   Webhook receiver endpoint and error logging
 |   |-- db.py             Connections, migrations and row models
-|   |-- lifecycle.py      Event statuses, allowed transitions and errors
-|   |-- main.py           App factory, router and logging setup
+|   |-- engine.py         Background processing loop
+|   |-- lifecycle.py      Event statuses, allowed transitions and failure kinds
+|   |-- main.py           App factory, router, engine startup and logging
 |   |-- repositories/
 |   |   |-- __init__.py
 |   |   `-- events.py     EventRepository, the only place with event SQL
@@ -371,7 +495,7 @@ Behaviour worth knowing:
 |   |   `-- event.py      WebhookEvent data contract
 |   `-- services/
 |       |-- __init__.py
-|       `-- events.py     EventService, the shared application rules
+|       `-- events.py     EventService and processing policy
 |-- tests/
 |   |-- conftest.py            Shared app and client fixtures on a temp database
 |   |-- test_health.py         Health endpoint test
@@ -382,6 +506,8 @@ Behaviour worth knowing:
 |   |-- test_lifecycle.py      EventService lifecycle tests
 |   |-- test_migrations.py     Schema versioning tests
 |   |-- test_idempotency.py    API level duplicate delivery tests
+|   |-- test_processing.py     Retry, backoff, classification and dead-letter tests
+|   |-- test_engine.py         Background loop and FastAPI integration tests
 |   |-- test_persistence.py    API to database tests and restart behaviour
 |   `-- test_inspect_events.py Inspector tool tests
 |-- tools/
@@ -404,6 +530,10 @@ advance.
 | --- | --- | --- |
 | `HOOKWATCH_DB_PATH` | `hookwatch.db` | SQLite database file. Read once at startup. |
 
+Processing intervals, attempt limits and backoff values are code defaults in
+`ProcessingSettings`. They are not environment variables yet, because deployment
+configuration belongs to the production hardening stage.
+
 Nothing else is configurable yet. There are no secrets and no authentication.
 
 ## Not implemented yet
@@ -411,11 +541,11 @@ Nothing else is configurable yet. There are no secrets and no authentication.
 These are planned but deliberately absent, so nothing here should be assumed to
 exist:
 
-- The processing engine. Stored events stay `received`; the service methods that
-  open and close attempts are only used by tests.
-- Automatic retries, a retry schedule or dead-letter handling
-- Event inspection over HTTP. Use `tools/inspect_events.py` until then.
+- Event inspection over HTTP and dead-letter listing. Use
+  `tools/inspect_events.py` until then.
+- Event replay
 - Signature verification, rate limiting or authentication
 - Payload size limits at the HTTP layer
 - Retention, archival or cleanup of stored events
+- Operational metrics or dashboards
 - MCP tools and resources

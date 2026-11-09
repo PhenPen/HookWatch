@@ -82,12 +82,12 @@ def test_same_event_id_from_another_source_is_a_new_event(
 
 
 def test_duplicate_detection_survives_a_restart(database_path: Path) -> None:
-    first_app = create_app(database_path)
+    first_app = create_app(database_path, start_engine=False)
     with TestClient(first_app) as first_client:
         assert first_client.post("/webhooks/github", json=VALID_EVENT).status_code == 202
 
     # A fresh application object on the same file stands in for a restart.
-    second_app = create_app(database_path)
+    second_app = create_app(database_path, start_engine=False)
     with TestClient(second_app) as second_client:
         response = second_client.post("/webhooks/github", json=VALID_EVENT)
 

@@ -40,6 +40,15 @@ def build_version_one(database_path: Path) -> None:
         connection.execute("PRAGMA user_version = 1")
 
 
+def build_version(database_path: Path, version: int) -> None:
+    """Apply the first versions migrations by hand, then pin the version."""
+    with sqlite3.connect(database_path) as connection:
+        for migration in MIGRATIONS[:version]:
+            for statement in migration:
+                connection.execute(statement)
+        connection.execute(f"PRAGMA user_version = {version}")
+
+
 def insert_event(
     database_path: Path,
     source: str,
@@ -70,8 +79,10 @@ def test_fresh_database_gets_every_migration(database_path: Path) -> None:
     assert applied == len(MIGRATIONS)
     assert read_version(database_path) == schema_version()
     assert {"events", "attempts"} <= read_tables(database_path)
-    assert "status" in read_columns(database_path, "events")
+    assert {"status", "dead_lettered_at"} <= read_columns(database_path, "events")
+    assert "failure_kind" in read_columns(database_path, "attempts")
     assert "events_source_event_id" in read_indexes(database_path)
+    assert "events_status_idx" in read_indexes(database_path)
 
 
 def test_migrating_twice_changes_nothing(database_path: Path) -> None:
@@ -97,6 +108,26 @@ def test_version_one_database_is_upgraded_in_place(database_path: Path) -> None:
             "SELECT source, event_id, status FROM events"
         ).fetchone()
     assert row == ("github", "evt_1", "received")
+
+
+def test_version_three_database_gets_the_processing_columns(
+    database_path: Path,
+) -> None:
+    build_version(database_path, 3)
+    insert_event(database_path, "github", "evt_1")
+
+    applied = migrate(database_path)
+
+    assert applied == 1
+    assert read_version(database_path) == schema_version()
+    assert "dead_lettered_at" in read_columns(database_path, "events")
+    assert "failure_kind" in read_columns(database_path, "attempts")
+    assert "events_status_idx" in read_indexes(database_path)
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT source, event_id, dead_lettered_at FROM events"
+        ).fetchone()
+    assert row == ("github", "evt_1", None)
 
 
 def test_upgrade_deduplicates_existing_rows(database_path: Path) -> None:

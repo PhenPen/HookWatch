@@ -41,6 +41,11 @@ def format_event(event: StoredEvent) -> str:
             "occurred_at": event.occurred_at.isoformat(),
             "received_at": event.received_at.isoformat(),
             "status": event.status.value,
+            "dead_lettered_at": (
+                event.dead_lettered_at.isoformat()
+                if event.dead_lettered_at is not None
+                else None
+            ),
             "data": event.data,
         },
         ensure_ascii=False,

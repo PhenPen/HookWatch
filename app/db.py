@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from app.lifecycle import AttemptOutcome, EventStatus
+from app.lifecycle import AttemptOutcome, EventStatus, FailureKind
 
 # Each entry is one schema version. Statements are executed in order inside a
 # transaction, then PRAGMA user_version is bumped. SQLite stores that integer in
@@ -63,6 +63,17 @@ MIGRATIONS: list[list[str]] = [
         )
         """,
     ],
+    # Version 4: information the processing engine needs. Failure kind says
+    # whether an attempt was retryable or permanent. The dead-letter timestamp
+    # marks an event that will not be retried again.
+    [
+        """
+        ALTER TABLE attempts ADD COLUMN failure_kind TEXT
+            CHECK (failure_kind IN ('retryable', 'permanent'))
+        """,
+        "ALTER TABLE events ADD COLUMN dead_lettered_at TEXT",
+        "CREATE INDEX IF NOT EXISTS events_status_idx ON events (status)",
+    ],
 ]
 
 
@@ -83,6 +94,7 @@ class StoredEvent:
     data: dict[str, Any]
     received_at: datetime
     status: EventStatus
+    dead_lettered_at: datetime | None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "StoredEvent":
@@ -95,6 +107,11 @@ class StoredEvent:
             data=json.loads(row["data"]),
             received_at=datetime.fromisoformat(row["received_at"]),
             status=EventStatus(row["status"]),
+            dead_lettered_at=(
+                datetime.fromisoformat(row["dead_lettered_at"])
+                if row["dead_lettered_at"] is not None
+                else None
+            ),
         )
 
 
@@ -108,6 +125,7 @@ class Attempt:
     started_at: datetime
     finished_at: datetime | None
     outcome: AttemptOutcome | None
+    failure_kind: FailureKind | None
     error: str | None
 
     @classmethod
@@ -124,6 +142,11 @@ class Attempt:
             ),
             outcome=(
                 AttemptOutcome(row["outcome"]) if row["outcome"] is not None else None
+            ),
+            failure_kind=(
+                FailureKind(row["failure_kind"])
+                if row["failure_kind"] is not None
+                else None
             ),
             error=row["error"],
         )

@@ -16,7 +16,7 @@ def database_path(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def app(database_path: Path) -> FastAPI:
-    return create_app(database_path)
+    return create_app(database_path, start_engine=False)
 
 
 @pytest.fixture

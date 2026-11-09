@@ -7,18 +7,14 @@ from app.services.events import EventService
 
 
 def get_event_repository(request: Request) -> EventRepository:
-    """Return the repository built during application startup.
-
-    Using the application state keeps tests able to build an app pointed at a
-    temporary database, without any global configuration or monkeypatching.
-    """
+    """Return the repository built during application startup."""
     return request.app.state.events
 
 
 def get_event_service(request: Request) -> EventService:
-    """Build the service around the shared repository.
+    """Return the service built during application startup.
 
-    The service is stateless, so constructing one per request costs nothing and
-    keeps the rules out of the route.
+    The same instance is used by the HTTP route and the processing engine, so
+    ingestion and processing share one repository and one set of settings.
     """
-    return EventService(get_event_repository(request))
+    return request.app.state.event_service

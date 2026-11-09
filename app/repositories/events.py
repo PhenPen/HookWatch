@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.db import Attempt, StoredEvent, connect
-from app.lifecycle import AttemptOutcome, EventStatus
+from app.lifecycle import AttemptOutcome, EventStatus, FailureKind
 from app.schemas.event import WebhookEvent
 
 
@@ -114,24 +114,62 @@ class EventRepository:
 
         return [StoredEvent.from_row(row) for row in rows]
 
-    def begin_attempt(
-        self,
-        record_id: int,
-        started_at: datetime | None = None,
-    ) -> int:
-        """Open a new attempt and mark the event as processing.
+    def list_pending(self, limit: int = 50) -> list[StoredEvent]:
+        """Return events the engine may look at, oldest first.
 
-        Both writes happen in one transaction, so the event cannot end up
-        processing with no attempt recorded. Transition rules are checked by the
-        service before calling this; the repository only writes what it is told.
+        Received events are always candidates. Failed events are candidates
+        only while they have not been dead-lettered; the service then applies
+        the attempt limit and backoff before claiming one.
+        """
+        with closing(connect(self.database_path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM events
+                WHERE (status = ? OR status = ?)
+                  AND dead_lettered_at IS NULL
+                ORDER BY id
+                LIMIT ?
+                """,
+                (EventStatus.RECEIVED.value, EventStatus.FAILED.value, limit),
+            ).fetchall()
+
+        return [StoredEvent.from_row(row) for row in rows]
+
+    def claim(self, record_id: int, started_at: datetime | None = None) -> int | None:
+        """Take ownership of an event and open a new attempt.
+
+        Returns the attempt id, or None when another worker won the race or the
+        event is not claimable. The conditional UPDATE is the important part:
+        it only changes a row that is still received or failed, so the database
+        decides which worker owns the event.
+
+        The status change and the attempt insert happen in one transaction, so
+        an event cannot be processing with no attempt recorded.
+
+        Transition rules are checked by the service before calling this; the
+        repository only writes what it is told.
         """
         started = (started_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
 
         with closing(connect(self.database_path)) as connection, connection:
-            connection.execute(
-                "UPDATE events SET status = ? WHERE id = ?",
-                (EventStatus.PROCESSING.value, record_id),
+            cursor = connection.execute(
+                """
+                UPDATE events
+                SET status = ?
+                WHERE id = ?
+                  AND dead_lettered_at IS NULL
+                  AND status IN (?, ?)
+                """,
+                (
+                    EventStatus.PROCESSING.value,
+                    record_id,
+                    EventStatus.RECEIVED.value,
+                    EventStatus.FAILED.value,
+                ),
             )
+            if cursor.rowcount == 0:
+                return None
+
             next_number = connection.execute(
                 """
                 SELECT COALESCE(MAX(attempt_number), 0) + 1
@@ -142,13 +180,14 @@ class EventRepository:
             ).fetchone()[0]
             cursor = connection.execute(
                 """
-                INSERT INTO attempts (event_row_id, attempt_number, started_at)
+                INSERT INTO attempts
+                    (event_row_id, attempt_number, started_at)
                 VALUES (?, ?, ?)
                 """,
                 (record_id, next_number, started.isoformat()),
             )
 
-        return int(cursor.lastrowid)
+            return int(cursor.lastrowid)
 
     def complete_attempt(
         self,
@@ -156,6 +195,8 @@ class EventRepository:
         event_status: EventStatus,
         outcome: AttemptOutcome,
         error: str | None = None,
+        failure_kind: FailureKind | None = None,
+        dead_letter: bool = False,
         finished_at: datetime | None = None,
     ) -> bool:
         """Close an open attempt and move its event to a final status.
@@ -163,30 +204,130 @@ class EventRepository:
         Returns False when the attempt is missing or already finished, which is
         what makes finishing twice a detectable mistake instead of a silent
         overwrite.
+
+        When dead_letter is true the event also gets a dead-letter timestamp in
+        the same transaction, so the failure and the decision to stop retrying
+        cannot disagree.
         """
         finished = (finished_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        kind = failure_kind.value if failure_kind is not None else None
 
         with closing(connect(self.database_path)) as connection, connection:
             cursor = connection.execute(
                 """
                 UPDATE attempts
-                SET finished_at = ?, outcome = ?, error = ?
+                SET finished_at = ?, outcome = ?, error = ?, failure_kind = ?
                 WHERE id = ? AND finished_at IS NULL
                 """,
-                (finished.isoformat(), outcome.value, error, attempt_id),
+                (finished.isoformat(), outcome.value, error, kind, attempt_id),
             )
             if cursor.rowcount == 0:
                 return False
 
-            connection.execute(
+            if dead_letter:
+                connection.execute(
+                    """
+                    UPDATE events
+                    SET status = ?, dead_lettered_at = ?
+                    WHERE id = (SELECT event_row_id FROM attempts WHERE id = ?)
+                    """,
+                    (event_status.value, finished.isoformat(), attempt_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE events
+                    SET status = ?
+                    WHERE id = (SELECT event_row_id FROM attempts WHERE id = ?)
+                    """,
+                    (event_status.value, attempt_id),
+                )
+            return True
+
+    def recover_abandoned(
+        self,
+        cutoff: datetime,
+        recovered_at: datetime | None = None,
+    ) -> int:
+        """Close attempts whose worker disappeared before finishing.
+
+        An open attempt is a lease. If the process that claimed it died, the
+        attempt keeps finished_at NULL and the event stays processing forever.
+        Any attempt started before the cutoff is treated as abandoned, closed
+        as a retryable failure, and its event is moved to failed so the normal
+        retry path can pick it up.
+
+        Returns how many attempts were closed.
+        """
+        cutoff_iso = cutoff.astimezone(timezone.utc).isoformat()
+        finished = (recovered_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        recovered = 0
+
+        with closing(connect(self.database_path)) as connection, connection:
+            rows = connection.execute(
+                """
+                SELECT id, event_row_id FROM attempts
+                WHERE finished_at IS NULL AND started_at < ?
+                """,
+                (cutoff_iso,),
+            ).fetchall()
+
+            for row in rows:
+                cursor = connection.execute(
+                    """
+                    UPDATE attempts
+                    SET finished_at = ?, outcome = ?, error = ?, failure_kind = ?
+                    WHERE id = ? AND finished_at IS NULL
+                    """,
+                    (
+                        finished.isoformat(),
+                        AttemptOutcome.FAILED.value,
+                        "abandoned: worker stopped before finishing",
+                        FailureKind.RETRYABLE.value,
+                        row["id"],
+                    ),
+                )
+                if cursor.rowcount == 0:
+                    continue
+
+                connection.execute(
+                    """
+                    UPDATE events
+                    SET status = ?
+                    WHERE id = ? AND status = ?
+                    """,
+                    (
+                        EventStatus.FAILED.value,
+                        row["event_row_id"],
+                        EventStatus.PROCESSING.value,
+                    ),
+                )
+                recovered += 1
+
+        return recovered
+
+    def mark_dead_letter(
+        self,
+        record_id: int,
+        at: datetime | None = None,
+    ) -> bool:
+        """Stop retrying an event without deleting it.
+
+        Returns False when the event is already dead-lettered, so two workers
+        cannot both claim to have made the decision.
+        """
+        timestamp = (at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+
+        with closing(connect(self.database_path)) as connection, connection:
+            cursor = connection.execute(
                 """
                 UPDATE events
-                SET status = ?
-                WHERE id = (SELECT event_row_id FROM attempts WHERE id = ?)
+                SET dead_lettered_at = ?
+                WHERE id = ? AND dead_lettered_at IS NULL
                 """,
-                (event_status.value, attempt_id),
+                (timestamp.isoformat(), record_id),
             )
-            return True
+            return cursor.rowcount == 1
 
     def get_attempt(self, attempt_id: int) -> Attempt | None:
         with closing(connect(self.database_path)) as connection:

@@ -23,6 +23,13 @@ class AttemptOutcome(StrEnum):
     FAILED = "failed"
 
 
+class FailureKind(StrEnum):
+    """Whether a failed attempt is worth retrying."""
+
+    RETRYABLE = "retryable"
+    PERMANENT = "permanent"
+
+
 # The only status changes allowed. Anything absent from this table is refused,
 # which is what stops an event from skipping stages or restarting after success.
 ALLOWED_TRANSITIONS: dict[EventStatus, set[EventStatus]] = {
@@ -43,6 +50,14 @@ class InvalidTransitionError(Exception):
 
 class AttemptNotOpenError(Exception):
     """Raised when finishing an attempt that is missing or already finished."""
+
+
+class RetryableProcessingError(Exception):
+    """A temporary failure. The event should be tried again later."""
+
+
+class PermanentProcessingError(Exception):
+    """A failure that will not fix itself. The event should not be retried."""
 
 
 def ensure_transition_allowed(current: EventStatus, target: EventStatus) -> None:
