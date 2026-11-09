@@ -48,15 +48,16 @@ def test_rejected_event_is_not_stored(client: TestClient, app: FastAPI) -> None:
     assert app.state.events.list() == []
 
 
-def test_duplicate_deliveries_are_both_stored(
+def test_duplicate_deliveries_store_one_row(
     client: TestClient,
     app: FastAPI,
 ) -> None:
-    # Deliberate: deduplication arrives in Stage 5.
-    client.post("/webhooks/github", json=VALID_EVENT)
-    client.post("/webhooks/github", json=VALID_EVENT)
+    first = client.post("/webhooks/github", json=VALID_EVENT)
+    second = client.post("/webhooks/github", json=VALID_EVENT)
 
-    assert len(app.state.events.list()) == 2
+    assert first.status_code == 202
+    assert second.status_code == 200
+    assert len(app.state.events.list()) == 1
 
 
 def test_events_are_scoped_by_source(client: TestClient, app: FastAPI) -> None:

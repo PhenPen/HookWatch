@@ -14,12 +14,13 @@ so it will not appear in a fresh clone of this repository.
 
 ## Status
 
-Stage 4 (persistence) is complete. The application starts, serves a health
-check, validates webhook event envelopes, accepts them at
+Stage 5 (event lifecycle and idempotency) is complete. The application starts,
+serves a health check, validates webhook event envelopes, accepts them at
 `POST /webhooks/{source}` and stores them in SQLite before responding, so
-events survive a restart. Processing, duplicate detection and inspection over
-HTTP do not exist yet. Stages are implemented one at a time, and each stage is
-committed separately.
+events survive a restart. A redelivered event is detected and acknowledged
+without creating a second row, and every event carries a lifecycle status.
+Processing, HTTP inspection and replay do not exist yet. Stages are implemented
+one at a time, and each stage is committed separately.
 
 | Stage | Scope | Status |
 | --- | --- | --- |
@@ -28,7 +29,7 @@ committed separately.
 | 2 | Webhook simulator | Complete |
 | 3 | Webhook receiver | Complete |
 | 4 | Persistence | Complete |
-| 5 | Event lifecycle and idempotency | Not started |
+| 5 | Event lifecycle and idempotency | Complete |
 | 6 | Processing engine | Not started |
 | 7 | Monitoring and event replay | Not started |
 | 8 | MCP server | Not started |
@@ -76,7 +77,7 @@ curl -i -X POST http://127.0.0.1:8000/webhooks/github \
   -d '{"event_id":"evt_1","event_type":"invoice.paid","occurred_at":"2026-11-07T12:00:00Z","data":{"amount":500}}'
 ```
 
-On success it answers `202 Accepted`:
+On success a new event is stored and answered with `202 Accepted`:
 
 ```json
 {"status": "accepted", "source": "github", "event_id": "evt_1"}
@@ -86,20 +87,37 @@ On success it answers `202 Accepted`:
 stored, but it is not processed yet. Returning `200` would imply the work is
 finished.
 
+If the same `source` and `event_id` were already stored, nothing new is written
+and the delivery is answered with `200 OK`:
+
+```json
+{"status": "duplicate", "source": "github", "event_id": "evt_1"}
+```
+
+Both responses are successes. Senders retry after timeouts, so the same event
+arriving twice is normal. `200` tells the sender that this exact event is
+already safe, which is a reason to stop retrying. The original stored payload is
+left untouched; a changed body with an already used event id does not overwrite
+it.
+
+Duplicate detection is keyed on `source` and `event_id` together, not on
+`event_id` alone, because two providers may legitimately use the same identifier.
 The `source` segment accepts 1 to 64 characters from letters, digits, dot, dash
 and underscore.
 
 | Status | Meaning |
 | --- | --- |
-| `202` | The event is valid, stored, and accepted. Processing does not exist yet. |
+| `202` | The event is new, valid, stored and accepted. Processing does not exist yet. |
+| `200` | The event was already stored. Nothing new was written. |
 | `404` | No route matched, for example `POST /webhooks` with no source segment. |
 | `405` | The method is not allowed, for example `GET /webhooks/github`. |
 | `422` | The body or the source segment failed validation. The response body lists every offending field. |
 
-Accepted and rejected requests are both logged:
+Accepted, duplicate and rejected requests are all logged:
 
 ```text
-INFO:app.api.webhooks:webhook accepted source=github event_id=evt_1 event_type=invoice.paid
+INFO:app.api.webhooks:webhook accepted source=github event_id=evt_1 event_type=invoice.paid row=1
+INFO:app.api.webhooks:webhook duplicate source=github event_id=evt_1 row=1
 WARNING:app.api.webhooks:request rejected path=/webhooks/github fields=[('body', 'event_id')]
 ```
 
@@ -123,16 +141,89 @@ The `events` table:
 | --- | --- | --- |
 | `id` | integer | Internal row key, assigned by the database. |
 | `source` | text | The `{source}` path segment the event arrived on. |
-| `event_id` | text | The identifier the sender supplied. Not unique yet. |
+| `event_id` | text | The identifier the sender supplied. Unique together with `source`. |
 | `event_type` | text | Provider-defined event name. |
 | `occurred_at` | text | When the sender says it happened, normalised to UTC. |
 | `data` | text | The payload as JSON. |
 | `received_at` | text | When HookWatch stored it, normalised to UTC. |
+| `status` | text | Lifecycle status: `received`, `processing`, `processed` or `failed`. |
+
+A unique index on `(source, event_id)` is what enforces idempotency. The insert
+uses `ON CONFLICT (source, event_id) DO NOTHING` and then checks how many rows
+changed, so the database makes the decision under its own lock. Checking with a
+`SELECT` first would leave a window in which two concurrent deliveries both
+believe they are first.
+
+The `attempts` table records one row per processing attempt:
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `id` | integer | Internal attempt key. |
+| `event_row_id` | integer | The `events.id` this attempt belongs to. |
+| `attempt_number` | integer | 1, 2, 3 and so on within one event. |
+| `started_at` | text | When the attempt began, in UTC. |
+| `finished_at` | text | When it ended, or null while it is open. |
+| `outcome` | text | `succeeded`, `failed`, or null while it is open. |
+| `error` | text | The failure message, when there was one. |
+
+Attempts exist so retries leave a history rather than overwriting a single
+counter. The processing engine that creates them arrives in the next stage; the
+table and the rules around it exist now.
 
 Timestamps are stored as ISO 8601 text in UTC. SQLite has no datetime type, and
 text in this fixed format sorts correctly. Offsets are converted to UTC first,
 because mixing `+01:00` and `Z` values in text comparison produces the wrong
 order.
+
+### Lifecycle
+
+An event moves through a small set of statuses:
+
+```text
+received --> processing --> processed
+                   |
+                   `--> failed --> processing (retry)
+```
+
+The rules live in `app/lifecycle.py` and are enforced by `EventService`, not by
+the route. The allowed moves are:
+
+| From | To |
+| --- | --- |
+| `received` | `processing` |
+| `processing` | `processed` or `failed` |
+| `failed` | `processing` (a retry) |
+| `processed` | nothing, it is terminal |
+
+Any other move raises `InvalidTransitionError`. Starting a second processing run
+on a `processed` event, for example, is refused instead of silently reopening
+finished work. Finishing an attempt that is missing or already finished raises
+`AttemptNotOpenError`, so closing the same attempt twice is a detectable mistake
+rather than a silent overwrite.
+
+Ingestion only creates `received` events, so the HTTP API cannot trigger a status
+change yet. The service methods and their tests are in place for the processing
+engine in Stage 6.
+
+### Migrations
+
+The schema is versioned with SQLite's `PRAGMA user_version`, which stores one
+integer in the database file itself. `app/db.py` holds an ordered list of
+migrations, and `migrate()` runs only the versions newer than the file reports.
+Each version runs in its own transaction and bumps the version only after all of
+its statements succeed, so a failure leaves the database at the last complete
+version instead of half upgraded.
+
+| Version | Contents |
+| --- | --- |
+| 1 | The original `events` table from Stage 4. |
+| 2 | Adds `status`, deduplicates any existing rows, then adds the unique index on `(source, event_id)`. |
+| 3 | Creates the `attempts` table. |
+
+Version 2 deletes all but the oldest row of every duplicate `(source, event_id)`
+pair before creating the unique index, because SQLite refuses to create a unique
+index while duplicates exist. This only affects data written before idempotency
+existed.
 
 Inspect what was stored:
 
@@ -145,26 +236,28 @@ uv run python -m tools.inspect_events --db C:\temp\other.db
 It prints one JSON object per line, newest first:
 
 ```json
-{"id": 2, "source": "github", "event_id": "evt_...", "event_type": "invoice.paid", "occurred_at": "2026-11-08T08:24:54+00:00", "received_at": "2026-11-08T08:24:54+00:00", "data": {}}
+{"id": 2, "source": "github", "event_id": "evt_...", "event_type": "invoice.paid", "occurred_at": "2026-11-08T08:24:54+00:00", "received_at": "2026-11-08T08:24:54+00:00", "status": "received", "data": {}}
 ```
 
 If the `sqlite3` command line tool is installed, the same data is available
 directly:
 
 ```shell
-sqlite3 hookwatch.db "SELECT id, source, event_type, received_at FROM events ORDER BY id DESC LIMIT 5;"
+sqlite3 hookwatch.db "SELECT id, source, event_id, status, received_at FROM events ORDER BY id DESC LIMIT 5;"
 ```
 
 Known limits at this stage:
 
-- The schema is created with `CREATE TABLE IF NOT EXISTS` at startup. There is
-  no migration tool. That works for creating a table, but cannot alter one, so
-  the first schema change will need its own decision.
-- There is no unique constraint on `source` and `event_id`. A redelivered event
-  is stored again as a new row. Duplicate detection is the next stage.
-- The table grows forever. There is no retention, archival or cleanup.
-- SQL access is confined to `app/repositories/`. Routes never see SQL, so
-  replacing SQLite later means rewriting one class.
+- There is no processing engine yet, so every stored event stays `received` and
+  the `attempts` table is only exercised by tests.
+- Storing a delivery is one atomic statement, and opening or closing an attempt
+  is one transaction. A crash between opening and closing an attempt would,
+  however, leave an event `processing` with an open attempt. Recovering those is
+  part of the processing engine stage.
+- The tables grow forever. There is no retention, archival or cleanup.
+- SQL access is confined to `app/repositories/`. Routes and services never see a
+  connection or a table name, so replacing SQLite later means rewriting one
+  class.
 
 ## Webhook simulator
 
@@ -201,12 +294,17 @@ delivery failed or could not be sent, `2` when the arguments or the generated
 event were invalid.
 
 Against a running HookWatch instance the default URL targets the receiver above,
-so a valid delivery returns `202` and the tool exits `0`. Use `--raw` to send a
-broken payload and watch the receiver reject it with `422`.
+so a new event returns `202` and the tool exits `0`. A redelivery returns `200`
+with status `duplicate`, which is still a 2xx response and also exits `0`. Use
+`--raw` to send a broken payload and watch the receiver reject it with `422`.
 
-Sending the same `--event-id` more than once delivers the same event repeatedly,
-which is how duplicate deliveries will be exercised once duplicate detection
-exists.
+Sending the same `--event-id` more than once delivers the same event repeatedly.
+That now exercises idempotency: the first delivery is stored and answered with
+`202`, every later one is answered with `200` and no second row is written.
+
+```shell
+uv run python -m tools.simulate_webhook --event-id evt_fixed --count 2
+```
 
 The simulator relies on development dependencies, which `uv run` installs by
 default.
@@ -262,14 +360,18 @@ Behaviour worth knowing:
 |   |   |-- __init__.py
 |   |   |-- deps.py       Shared route dependencies
 |   |   `-- webhooks.py   Webhook receiver endpoint and error logging
-|   |-- db.py             SQLite connection, schema and stored event model
+|   |-- db.py             Connections, migrations and row models
+|   |-- lifecycle.py      Event statuses, allowed transitions and errors
 |   |-- main.py           App factory, router and logging setup
 |   |-- repositories/
 |   |   |-- __init__.py
 |   |   `-- events.py     EventRepository, the only place with event SQL
-|   `-- schemas/
+|   |-- schemas/
+|   |   |-- __init__.py
+|   |   `-- event.py      WebhookEvent data contract
+|   `-- services/
 |       |-- __init__.py
-|       `-- event.py      WebhookEvent data contract
+|       `-- events.py     EventService, the shared application rules
 |-- tests/
 |   |-- conftest.py            Shared app and client fixtures on a temp database
 |   |-- test_health.py         Health endpoint test
@@ -277,6 +379,9 @@ Behaviour worth knowing:
 |   |-- test_simulator.py      Webhook simulator tests
 |   |-- test_webhooks.py       Receiver API tests
 |   |-- test_events_repository.py  Repository tests
+|   |-- test_lifecycle.py      EventService lifecycle tests
+|   |-- test_migrations.py     Schema versioning tests
+|   |-- test_idempotency.py    API level duplicate delivery tests
 |   |-- test_persistence.py    API to database tests and restart behaviour
 |   `-- test_inspect_events.py Inspector tool tests
 |-- tools/
@@ -288,8 +393,10 @@ Behaviour worth knowing:
 `-- hookwatch_implementation.md   Local specification, not tracked by Git
 ```
 
-The package layout is intentionally minimal. Directories for services,
-persistence and MCP will be added when a stage needs them, not in advance.
+The package layout is intentionally minimal. The business rules live in
+`app/services/` so the HTTP API and the future MCP server can call the same
+methods. Directories for MCP will be added when a stage needs them, not in
+advance.
 
 ## Configuration
 
@@ -304,10 +411,9 @@ Nothing else is configurable yet. There are no secrets and no authentication.
 These are planned but deliberately absent, so nothing here should be assumed to
 exist:
 
-- Duplicate detection and idempotent processing. Redeliveries are stored again.
-- Automatic database schema migrations. The schema is created once with
-  `CREATE TABLE IF NOT EXISTS`.
-- Background processing, retries or dead-letter handling
+- The processing engine. Stored events stay `received`; the service methods that
+  open and close attempts are only used by tests.
+- Automatic retries, a retry schedule or dead-letter handling
 - Event inspection over HTTP. Use `tools/inspect_events.py` until then.
 - Signature verification, rate limiting or authentication
 - Payload size limits at the HTTP layer

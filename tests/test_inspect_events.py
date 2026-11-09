@@ -4,17 +4,17 @@ from pathlib import Path
 
 import pytest
 
-from app.db import initialize_database
+from app.db import migrate
 from app.repositories.events import EventRepository
 from app.schemas.event import WebhookEvent
 from tools.inspect_events import main
 
 
 def seed(database_path: Path, count: int) -> None:
-    initialize_database(database_path)
+    migrate(database_path)
     repository = EventRepository(database_path)
     for index in range(count):
-        repository.add(
+        repository.insert_if_new(
             "github",
             WebhookEvent(
                 event_id=f"evt_{index}",
@@ -39,6 +39,7 @@ def test_prints_events_newest_first(
     assert first["event_id"] == "evt_1"
     assert first["source"] == "github"
     assert first["data"] == {"amount": 1}
+    assert first["status"] == "received"
     assert first["occurred_at"] == "2026-11-07T12:00:00+00:00"
 
 
@@ -57,7 +58,7 @@ def test_reports_an_empty_database(
     database_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    initialize_database(database_path)
+    migrate(database_path)
 
     assert main(["--db", str(database_path)]) == 0
     assert "no events stored" in capsys.readouterr().out

@@ -1,4 +1,4 @@
-"""SQLite connection helpers, schema and the stored event row model."""
+"""SQLite connections, schema migrations and row models."""
 
 import json
 import sqlite3
@@ -8,17 +8,62 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    source      TEXT NOT NULL,
-    event_id    TEXT NOT NULL,
-    event_type  TEXT NOT NULL,
-    occurred_at TEXT NOT NULL,
-    data        TEXT NOT NULL,
-    received_at TEXT NOT NULL
-);
-"""
+from app.lifecycle import AttemptOutcome, EventStatus
+
+# Each entry is one schema version. Statements are executed in order inside a
+# transaction, then PRAGMA user_version is bumped. SQLite stores that integer in
+# the file itself, and PRAGMA user_version is how the next startup knows which
+# migrations are already applied.
+MIGRATIONS: list[list[str]] = [
+    # Version 1: the original single table, as created in Stage 4.
+    [
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            source      TEXT NOT NULL,
+            event_id    TEXT NOT NULL,
+            event_type  TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            data        TEXT NOT NULL,
+            received_at TEXT NOT NULL
+        )
+        """,
+    ],
+    # Version 2: lifecycle status and database enforced idempotency.
+    [
+        # Rows stored before idempotency existed may contain duplicates. The
+        # unique index below cannot be created while they exist, so keep the
+        # oldest row of each (source, event_id) pair and discard the rest.
+        """
+        DELETE FROM events
+        WHERE id NOT IN (SELECT MIN(id) FROM events GROUP BY source, event_id)
+        """,
+        """
+        ALTER TABLE events ADD COLUMN status TEXT NOT NULL DEFAULT 'received'
+            CHECK (status IN ('received', 'processing', 'processed', 'failed'))
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS events_source_event_id
+            ON events (source, event_id)
+        """,
+    ],
+    # Version 3: one row per processing attempt, giving a history rather than a
+    # single counter.
+    [
+        """
+        CREATE TABLE IF NOT EXISTS attempts (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_row_id   INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+            attempt_number INTEGER NOT NULL,
+            started_at     TEXT NOT NULL,
+            finished_at    TEXT,
+            outcome        TEXT CHECK (outcome IN ('succeeded', 'failed')),
+            error          TEXT,
+            UNIQUE (event_row_id, attempt_number)
+        )
+        """,
+    ],
+]
 
 
 @dataclass(frozen=True)
@@ -26,8 +71,8 @@ class StoredEvent:
     """One event as it exists in the database.
 
     This is a read model, not the request contract: it carries fields that the
-    sender never provided, such as the database id and the moment we received
-    the event.
+    sender never provided, such as the database id, the current status and the
+    moment we received the event.
     """
 
     id: int
@@ -37,6 +82,7 @@ class StoredEvent:
     occurred_at: datetime
     data: dict[str, Any]
     received_at: datetime
+    status: EventStatus
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "StoredEvent":
@@ -48,11 +94,51 @@ class StoredEvent:
             occurred_at=datetime.fromisoformat(row["occurred_at"]),
             data=json.loads(row["data"]),
             received_at=datetime.fromisoformat(row["received_at"]),
+            status=EventStatus(row["status"]),
         )
 
 
+@dataclass(frozen=True)
+class Attempt:
+    """One recorded attempt to process an event."""
+
+    id: int
+    event_row_id: int
+    attempt_number: int
+    started_at: datetime
+    finished_at: datetime | None
+    outcome: AttemptOutcome | None
+    error: str | None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Attempt":
+        return cls(
+            id=row["id"],
+            event_row_id=row["event_row_id"],
+            attempt_number=row["attempt_number"],
+            started_at=datetime.fromisoformat(row["started_at"]),
+            finished_at=(
+                datetime.fromisoformat(row["finished_at"])
+                if row["finished_at"] is not None
+                else None
+            ),
+            outcome=(
+                AttemptOutcome(row["outcome"]) if row["outcome"] is not None else None
+            ),
+            error=row["error"],
+        )
+
+
+def schema_version() -> int:
+    """The version a fully migrated database should report."""
+    return len(MIGRATIONS)
+
+
 def connect(database_path: Path) -> sqlite3.Connection:
-    """Open a connection with row access by column name.
+    """Open a connection with row access by column name and foreign keys on.
+
+    SQLite disables foreign key enforcement per connection by default, so the
+    pragma here is what makes the references in the schema mean anything.
 
     Connections are short-lived and opened by whichever method needs one. That
     keeps this module free of shared mutable state, so no locking or thread
@@ -60,15 +146,27 @@ def connect(database_path: Path) -> sqlite3.Connection:
     """
     connection = sqlite3.connect(database_path, timeout=5.0)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
     return connection
 
 
-def initialize_database(database_path: Path) -> None:
-    """Create the schema if it does not exist yet.
+def migrate(database_path: Path) -> int:
+    """Apply every migration newer than the database version.
 
-    CREATE TABLE IF NOT EXISTS is the simplest safe initialization for a single
-    table. It cannot alter an existing table, so the first schema change will
-    need a real migration decision instead of another call to this function.
+    Returns how many migrations ran. A fresh database runs all of them; an
+    existing one runs only the new ones. Each migration commits before the next
+    starts, so a failure leaves the database at the last fully applied version
+    rather than half way through a version.
     """
-    with closing(connect(database_path)) as connection, connection:
-        connection.executescript(SCHEMA)
+    with closing(connect(database_path)) as connection:
+        current = connection.execute("PRAGMA user_version").fetchone()[0]
+        applied = 0
+
+        for version in range(current, len(MIGRATIONS)):
+            with connection:
+                for statement in MIGRATIONS[version]:
+                    connection.execute(statement)
+                connection.execute(f"PRAGMA user_version = {version + 1}")
+            applied += 1
+
+        return applied

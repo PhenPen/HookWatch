@@ -16,13 +16,15 @@ from fastapi.exceptions import RequestValidationError
 
 from app.api.webhooks import log_validation_error
 from app.api.webhooks import router as webhooks_router
-from app.db import initialize_database
+from app.db import migrate
 from app.repositories.events import EventRepository
 
 # uvicorn configures only its own loggers, so without this the application's
 # INFO messages would be dropped silently. Structured logging is left to the
 # production hardening stage.
 logging.basicConfig(level=logging.INFO)
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DATABASE_PATH = Path("hookwatch.db")
 
@@ -40,7 +42,9 @@ def create_app(database_path: Path | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        initialize_database(path)
+        applied = migrate(path)
+        if applied:
+            logger.info("applied %s database migration(s) to %s", applied, path)
         app.state.events = EventRepository(path)
         yield
 

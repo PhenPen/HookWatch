@@ -40,6 +40,7 @@ def format_event(event: StoredEvent) -> str:
             "event_type": event.event_type,
             "occurred_at": event.occurred_at.isoformat(),
             "received_at": event.received_at.isoformat(),
+            "status": event.status.value,
             "data": event.data,
         },
         ensure_ascii=False,

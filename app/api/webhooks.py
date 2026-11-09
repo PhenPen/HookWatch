@@ -6,10 +6,11 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Path, Request, Response, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
-from app.api.deps import get_event_repository
-from app.repositories.events import EventRepository
+from app.api.deps import get_event_service
 from app.schemas.event import WebhookEvent
+from app.services.events import EventService
 
 logger = logging.getLogger(__name__)
 
@@ -33,27 +34,52 @@ SourceName = Annotated[
 def receive_webhook(
     source: SourceName,
     event: WebhookEvent,
-    repository: Annotated[EventRepository, Depends(get_event_repository)],
-) -> dict[str, str]:
-    """Accept one webhook event and store it.
+    service: Annotated[EventService, Depends(get_event_service)],
+) -> JSONResponse:
+    """Accept one webhook event and store it unless it is a redelivery.
 
     Validation happens before this function runs. FastAPI parses the body into
     a WebhookEvent and returns 422 without calling us if anything is wrong, so
     by this point the event is known to satisfy the contract.
 
-    The event is written to the database before the response is sent, so a 202
-    means "stored", not merely "received". Processing still does not exist;
-    that arrives in a later stage.
+    Two successful outcomes exist. A new event is stored and answered with 202.
+    An event we already have is answered with 200 and status "duplicate": the
+    delivery succeeded, nothing new was queued, and the sender should stop
+    retrying.
     """
-    record_id = repository.add(source, event)
+    result = service.record_delivery(source, event)
+
+    if result.duplicate:
+        logger.info(
+            "webhook duplicate source=%s event_id=%s row=%s",
+            source,
+            event.event_id,
+            result.record_id,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "status": "duplicate",
+                "source": source,
+                "event_id": event.event_id,
+            },
+        )
+
     logger.info(
         "webhook accepted source=%s event_id=%s event_type=%s row=%s",
         source,
         event.event_id,
         event.event_type,
-        record_id,
+        result.record_id,
     )
-    return {"status": "accepted", "source": source, "event_id": event.event_id}
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "status": "accepted",
+            "source": source,
+            "event_id": event.event_id,
+        },
+    )
 
 
 async def log_validation_error(request: Request, exc: RequestValidationError) -> Response:
