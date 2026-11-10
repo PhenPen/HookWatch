@@ -78,9 +78,13 @@ def test_fresh_database_gets_every_migration(database_path: Path) -> None:
 
     assert applied == len(MIGRATIONS)
     assert read_version(database_path) == schema_version()
-    assert {"events", "attempts"} <= read_tables(database_path)
-    assert {"status", "dead_lettered_at"} <= read_columns(database_path, "events")
-    assert "failure_kind" in read_columns(database_path, "attempts")
+    assert {"events", "attempts", "replays"} <= read_tables(database_path)
+    assert {"status", "dead_lettered_at", "replay_count"} <= read_columns(
+        database_path, "events"
+    )
+    assert {"failure_kind", "replay_number"} <= read_columns(
+        database_path, "attempts"
+    )
     assert "events_source_event_id" in read_indexes(database_path)
     assert "events_status_idx" in read_indexes(database_path)
 
@@ -118,7 +122,7 @@ def test_version_three_database_gets_the_processing_columns(
 
     applied = migrate(database_path)
 
-    assert applied == 1
+    assert applied == len(MIGRATIONS) - 3
     assert read_version(database_path) == schema_version()
     assert "dead_lettered_at" in read_columns(database_path, "events")
     assert "failure_kind" in read_columns(database_path, "attempts")
@@ -128,6 +132,24 @@ def test_version_three_database_gets_the_processing_columns(
             "SELECT source, event_id, dead_lettered_at FROM events"
         ).fetchone()
     assert row == ("github", "evt_1", None)
+
+
+def test_version_four_database_gets_replay_support(database_path: Path) -> None:
+    build_version(database_path, 4)
+    insert_event(database_path, "github", "evt_1")
+
+    applied = migrate(database_path)
+
+    assert applied == 1
+    assert read_version(database_path) == schema_version()
+    assert "replays" in read_tables(database_path)
+    assert "replay_count" in read_columns(database_path, "events")
+    assert "replay_number" in read_columns(database_path, "attempts")
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT source, event_id, replay_count FROM events"
+        ).fetchone()
+    assert row == ("github", "evt_1", 0)
 
 
 def test_upgrade_deduplicates_existing_rows(database_path: Path) -> None:

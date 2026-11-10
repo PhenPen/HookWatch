@@ -74,6 +74,25 @@ MIGRATIONS: list[list[str]] = [
         "ALTER TABLE events ADD COLUMN dead_lettered_at TEXT",
         "CREATE INDEX IF NOT EXISTS events_status_idx ON events (status)",
     ],
+    # Version 5: replay support. replay_count identifies the current retry
+    # cycle for an event, so a replay starts with a fresh attempt budget while
+    # keeping every earlier attempt. The replays table is the audit trail: who
+    # asked for the replay, when, and why.
+    [
+        "ALTER TABLE events ADD COLUMN replay_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE attempts ADD COLUMN replay_number INTEGER NOT NULL DEFAULT 0",
+        """
+        CREATE TABLE IF NOT EXISTS replays (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_row_id  INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+            replay_number INTEGER NOT NULL,
+            requested_at  TEXT NOT NULL,
+            requested_by  TEXT NOT NULL,
+            reason        TEXT NOT NULL,
+            UNIQUE (event_row_id, replay_number)
+        )
+        """,
+    ],
 ]
 
 
@@ -95,6 +114,7 @@ class StoredEvent:
     received_at: datetime
     status: EventStatus
     dead_lettered_at: datetime | None
+    replay_count: int
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "StoredEvent":
@@ -112,6 +132,7 @@ class StoredEvent:
                 if row["dead_lettered_at"] is not None
                 else None
             ),
+            replay_count=row["replay_count"],
         )
 
 
@@ -122,6 +143,7 @@ class Attempt:
     id: int
     event_row_id: int
     attempt_number: int
+    replay_number: int
     started_at: datetime
     finished_at: datetime | None
     outcome: AttemptOutcome | None
@@ -134,6 +156,7 @@ class Attempt:
             id=row["id"],
             event_row_id=row["event_row_id"],
             attempt_number=row["attempt_number"],
+            replay_number=row["replay_number"],
             started_at=datetime.fromisoformat(row["started_at"]),
             finished_at=(
                 datetime.fromisoformat(row["finished_at"])
@@ -149,6 +172,29 @@ class Attempt:
                 else None
             ),
             error=row["error"],
+        )
+
+
+@dataclass(frozen=True)
+class Replay:
+    """One recorded operator request to process an event again."""
+
+    id: int
+    event_row_id: int
+    replay_number: int
+    requested_at: datetime
+    requested_by: str
+    reason: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Replay":
+        return cls(
+            id=row["id"],
+            event_row_id=row["event_row_id"],
+            replay_number=row["replay_number"],
+            requested_at=datetime.fromisoformat(row["requested_at"]),
+            requested_by=row["requested_by"],
+            reason=row["reason"],
         )
 
 

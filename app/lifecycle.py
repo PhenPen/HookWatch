@@ -38,8 +38,8 @@ ALLOWED_TRANSITIONS: dict[EventStatus, set[EventStatus]] = {
     # A retry after failure opens a new attempt. Retrying is a decision made by
     # the processing engine, not a free pass to reopen any other status.
     EventStatus.FAILED: {EventStatus.PROCESSING},
-    # Processed is terminal. Replay, when it arrives, copies the event into a
-    # new attempt through its own explicit path.
+    # Processed is terminal for ordinary processing. Replay is a separate,
+    # explicit operation that queues the existing event for another cycle.
     EventStatus.PROCESSED: set(),
 }
 
@@ -50,6 +50,10 @@ class InvalidTransitionError(Exception):
 
 class AttemptNotOpenError(Exception):
     """Raised when finishing an attempt that is missing or already finished."""
+
+
+class ReplayNotAllowedError(Exception):
+    """Raised when an event cannot be queued for replay in its current state."""
 
 
 class RetryableProcessingError(Exception):

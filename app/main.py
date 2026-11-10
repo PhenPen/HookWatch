@@ -15,6 +15,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 
+from app.api.events import router as events_router
 from app.api.webhooks import log_validation_error
 from app.api.webhooks import router as webhooks_router
 from app.db import migrate
@@ -37,6 +38,7 @@ def create_app(
     *,
     start_engine: bool = True,
     settings: ProcessingSettings | None = None,
+    replay_token: str | None = None,
 ) -> FastAPI:
     """Build the application.
 
@@ -47,11 +49,20 @@ def create_app(
     Tests that inspect stored rows set start_engine to False. Otherwise the
     background loop would process events while a test is asserting on their
     initial received state.
+
+    replay_token is the shared secret that enables replay. Passing an empty
+    string disables replay explicitly, which is how tests prove the closed
+    default even on a machine where the environment variable is set.
     """
     path = database_path or Path(
         os.environ.get("HOOKWATCH_DB_PATH", str(DEFAULT_DATABASE_PATH))
     )
     processing_settings = settings or ProcessingSettings()
+    token = (
+        replay_token
+        if replay_token is not None
+        else os.environ.get("HOOKWATCH_REPLAY_TOKEN") or None
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -64,6 +75,7 @@ def create_app(
         app.state.events = repository
         app.state.event_service = service
         app.state.settings = processing_settings
+        app.state.replay_token = token
 
         stop = asyncio.Event()
         engine_task: asyncio.Task[None] | None = None
@@ -80,6 +92,7 @@ def create_app(
     app = FastAPI(title="HookWatch", lifespan=lifespan)
 
     app.include_router(webhooks_router)
+    app.include_router(events_router)
     app.add_exception_handler(RequestValidationError, log_validation_error)
 
     @app.get("/health")

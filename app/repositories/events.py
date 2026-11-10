@@ -11,7 +11,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app.db import Attempt, StoredEvent, connect
+from app.db import Attempt, Replay, StoredEvent, connect
 from app.lifecycle import AttemptOutcome, EventStatus, FailureKind
 from app.schemas.event import WebhookEvent
 
@@ -106,10 +106,52 @@ class EventRepository:
         events received in the same microsecond would otherwise have an
         unstable order.
         """
+        return self.list_filtered(limit=limit)
+
+    def list_filtered(
+        self,
+        *,
+        source: str | None = None,
+        event_type: str | None = None,
+        status: EventStatus | None = None,
+        dead_lettered: bool | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[StoredEvent]:
+        """Return stored events matching every supplied filter, newest first.
+
+        Only fixed SQL fragments are assembled here. Filter values are always
+        bound parameters, so user input never becomes SQL.
+        """
+        clauses: list[str] = []
+        parameters: list[object] = []
+
+        if source is not None:
+            clauses.append("source = ?")
+            parameters.append(source)
+        if event_type is not None:
+            clauses.append("event_type = ?")
+            parameters.append(event_type)
+        if status is not None:
+            clauses.append("status = ?")
+            parameters.append(status.value)
+        if dead_lettered is True:
+            clauses.append("dead_lettered_at IS NOT NULL")
+        elif dead_lettered is False:
+            clauses.append("dead_lettered_at IS NULL")
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.extend((limit, offset))
+
         with closing(connect(self.database_path)) as connection:
             rows = connection.execute(
-                "SELECT * FROM events ORDER BY id DESC LIMIT ?",
-                (limit,),
+                f"""
+                SELECT * FROM events
+                {where}
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+                """,
+                parameters,
             ).fetchall()
 
         return [StoredEvent.from_row(row) for row in rows]
@@ -146,6 +188,10 @@ class EventRepository:
         The status change and the attempt insert happen in one transaction, so
         an event cannot be processing with no attempt recorded.
 
+        The attempt carries the event's current replay_count. That ties the try
+        to one retry cycle, so a replay can start a fresh budget without
+        discarding the attempts from earlier cycles.
+
         Transition rules are checked by the service before calling this; the
         repository only writes what it is told.
         """
@@ -170,6 +216,10 @@ class EventRepository:
             if cursor.rowcount == 0:
                 return None
 
+            replay_number = connection.execute(
+                "SELECT replay_count FROM events WHERE id = ?",
+                (record_id,),
+            ).fetchone()["replay_count"]
             next_number = connection.execute(
                 """
                 SELECT COALESCE(MAX(attempt_number), 0) + 1
@@ -181,10 +231,10 @@ class EventRepository:
             cursor = connection.execute(
                 """
                 INSERT INTO attempts
-                    (event_row_id, attempt_number, started_at)
-                VALUES (?, ?, ?)
+                    (event_row_id, attempt_number, replay_number, started_at)
+                VALUES (?, ?, ?, ?)
                 """,
-                (record_id, next_number, started.isoformat()),
+                (record_id, next_number, replay_number, started.isoformat()),
             )
 
             return int(cursor.lastrowid)
@@ -353,3 +403,98 @@ class EventRepository:
             ).fetchall()
 
         return [Attempt.from_row(row) for row in rows]
+
+    def count_attempts(self, record_id: int, replay_number: int) -> int:
+        """How many attempts this event has made in one replay cycle."""
+        with closing(connect(self.database_path)) as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM attempts
+                WHERE event_row_id = ? AND replay_number = ?
+                """,
+                (record_id, replay_number),
+            ).fetchone()
+
+        return int(row["total"])
+
+    def replay(
+        self,
+        record_id: int,
+        *,
+        replay_number: int,
+        requested_at: datetime,
+        requested_by: str,
+        reason: str,
+    ) -> Replay | None:
+        """Queue an existing event for another processing cycle.
+
+        Returns None when the event is missing or not in a replayable state.
+        The conditional UPDATE is the whole safeguard: only a failed or
+        processed event can move back to received, and only one replay request
+        can win that race. A second request then sees received and is refused.
+
+        The event row is never copied or reinserted, so replay cannot bypass
+        the unique index on (source, event_id). The queued attempt count is
+        reset by incrementing replay_count, while every earlier attempt stays
+        in place.
+
+        `replay_number` is supplied by the service and is the value the
+        increment will produce. The caller reads the event first, so the
+        repository does not have to guess between a missing row and a row that
+        changed after that read.
+        """
+        requested = requested_at.astimezone(timezone.utc).isoformat()
+
+        with closing(connect(self.database_path)) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE events
+                SET status = ?, dead_lettered_at = NULL,
+                    replay_count = replay_count + 1
+                WHERE id = ?
+                  AND replay_count = ?
+                  AND status IN (?, ?)
+                """,
+                (
+                    EventStatus.RECEIVED.value,
+                    record_id,
+                    replay_number - 1,
+                    EventStatus.FAILED.value,
+                    EventStatus.PROCESSED.value,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return None
+
+            cursor = connection.execute(
+                """
+                INSERT INTO replays
+                    (event_row_id, replay_number, requested_at, requested_by, reason)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (record_id, replay_number, requested, requested_by, reason),
+            )
+
+            return Replay(
+                id=int(cursor.lastrowid),
+                event_row_id=record_id,
+                replay_number=replay_number,
+                requested_at=datetime.fromisoformat(requested),
+                requested_by=requested_by,
+                reason=reason,
+            )
+
+    def list_replays(self, record_id: int) -> list[Replay]:
+        """Return the replay audit trail for one event, oldest first."""
+        with closing(connect(self.database_path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM replays
+                WHERE event_row_id = ?
+                ORDER BY replay_number
+                """,
+                (record_id,),
+            ).fetchall()
+
+        return [Replay.from_row(row) for row in rows]

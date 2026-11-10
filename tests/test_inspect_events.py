@@ -41,6 +41,7 @@ def test_prints_events_newest_first(
     assert first["data"] == {"amount": 1}
     assert first["status"] == "received"
     assert first["dead_lettered_at"] is None
+    assert first["replay_count"] == 0
     assert first["occurred_at"] == "2026-11-07T12:00:00+00:00"
 
 

@@ -14,15 +14,17 @@ so it will not appear in a fresh clone of this repository.
 
 ## Status
 
-Stage 6 (processing engine) is complete. The application starts, serves a
-health check, validates webhook event envelopes, accepts them at
+Stage 7 (monitoring and event replay) is complete. The application starts, serves
+a health check, validates webhook event envelopes, accepts them at
 `POST /webhooks/{source}` and stores them in SQLite before responding, so
 events survive a restart. A redelivered event is detected and acknowledged
 without creating a second row, and every event carries a lifecycle status. An
 in-process engine processes stored events, retries temporary failures with
 exponential backoff, classifies permanent failures and dead-letters events that
-will not be retried. HTTP inspection and replay do not exist yet. Stages are
-implemented one at a time, and each stage is committed separately.
+will not be retried. Events, attempts and replay history can be inspected over
+HTTP with filters, and failed or processed events can be queued for another
+processing cycle by an operator holding the replay token. Stages are implemented
+one at a time, and each stage is committed separately.
 
 | Stage | Scope | Status |
 | --- | --- | --- |
@@ -33,7 +35,7 @@ implemented one at a time, and each stage is committed separately.
 | 4 | Persistence | Complete |
 | 5 | Event lifecycle and idempotency | Complete |
 | 6 | Processing engine | Complete |
-| 7 | Monitoring and event replay | Not started |
+| 7 | Monitoring and event replay | Complete |
 | 8 | MCP server | Not started |
 | 9 | AI agent integration | Not started |
 | 10 | Production hardening | Not started |
@@ -62,6 +64,7 @@ uv run uvicorn app.main:app --reload
 ```
 
 - Health check: http://127.0.0.1:8000/health
+- Event monitoring: http://127.0.0.1:8000/events
 - Interactive API documentation: http://127.0.0.1:8000/docs
 
 The first start creates `hookwatch.db` in the working directory. See Storage
@@ -123,8 +126,124 @@ INFO:app.api.webhooks:webhook duplicate source=github event_id=evt_1 row=1
 WARNING:app.api.webhooks:request rejected path=/webhooks/github fields=[('body', 'event_id')]
 ```
 
-Requests are not authenticated and carry no signature. Anything that matches the
-schema is accepted, which is a known gap until the security work.
+Incoming deliveries are not authenticated and carry no signature. Anything that
+matches the schema is accepted, which is a known gap until the security work.
+Replay is the exception: it is guarded by a shared token, described below.
+
+## Inspecting events
+
+`GET /events` returns stored events newest first. Filters are exact matches and
+combine with AND:
+
+| Query | Meaning |
+| --- | --- |
+| `source` | Sending service, for example `github`. |
+| `event_type` | Provider event name, for example `invoice.paid`. |
+| `status` | `received`, `processing`, `processed` or `failed`. |
+| `dead_lettered` | `true` for events the engine has given up on, `false` for live events. |
+| `limit` | Rows to return, 1 to 200. Default 50. |
+| `offset` | Rows to skip. Default 0. |
+
+```shell
+curl "http://127.0.0.1:8000/events?status=failed&dead_lettered=true"
+curl "http://127.0.0.1:8000/events?source=github&limit=20&offset=20"
+```
+
+The listing omits `data`; payloads belong to the detail view and can be large.
+
+`GET /events/{id}` returns one event with its payload, processing attempts and
+replay history:
+
+```shell
+curl http://127.0.0.1:8000/events/1
+```
+
+```json
+{
+  "id": 1,
+  "source": "github",
+  "event_id": "evt_1",
+  "event_type": "invoice.paid",
+  "occurred_at": "2026-11-09T12:00:00Z",
+  "received_at": "2026-11-09T12:00:01.123456Z",
+  "status": "failed",
+  "dead_lettered_at": null,
+  "replay_count": 0,
+  "data": {"amount": 500},
+  "attempts": [
+    {
+      "attempt_number": 1,
+      "replay_number": 0,
+      "started_at": "2026-11-09T12:00:01.400000Z",
+      "finished_at": "2026-11-09T12:00:01.420000Z",
+      "outcome": "failed",
+      "failure_kind": "retryable",
+      "error": "downstream timeout"
+    }
+  ],
+  "replays": []
+}
+```
+
+Attempts are what makes a failure investigable: each row shows which try ran,
+whether it succeeded, whether the failure was retryable or permanent, and the
+stored error. An unknown id returns `404`; an invalid filter returns `422`.
+
+## Replay
+
+`POST /events/{id}/replay` queues an existing event for another processing
+cycle. Replay is an operator action, not a delivery: it never creates a second
+event row, so the unique index on `(source, event_id)` and duplicate detection
+are untouched.
+
+Replay is disabled unless `HOOKWATCH_REPLAY_TOKEN` is set. The caller must send
+it as a bearer token, and a reason is required:
+
+```shell
+curl -i -X POST http://127.0.0.1:8000/events/1/replay \
+  -H "Authorization: Bearer $HOOKWATCH_REPLAY_TOKEN" \
+  -H "X-Operator: alice" \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "fixed the downstream timeout"}'
+```
+
+```json
+{"status": "queued", "id": 1, "replay_number": 1}
+```
+
+`202` means queued, not processed. The engine picks the event up like any other
+waiting event. `X-Operator` is optional and recorded in the audit trail; it is
+not verified.
+
+| Status | Meaning |
+| --- | --- |
+| `202` | Queued for another cycle. |
+| `401` | Token missing or wrong. |
+| `403` | Replay is disabled because no token is configured. |
+| `404` | No event has that id. |
+| `409` | The event is `received` (already queued) or `processing` (in flight). |
+| `422` | The reason is missing, shorter than 3 or longer than 500 characters, or the body has unknown fields. |
+
+Safeguards, and why they exist:
+
+- Replay is closed by default. A missing environment variable disables it
+  instead of exposing it.
+- Only `failed` and `processed` events can be replayed. Queuing an event that is
+  already waiting, or replaying one that is mid-flight, is refused.
+- The state check is repeated in the conditional `UPDATE` that performs the
+  change, so two operators cannot both replay the same state. The second request
+  gets `409`.
+- Every accepted replay is recorded in the `replays` table with its number,
+  timestamp, operator and reason.
+- A replay starts a fresh attempt budget (`replay_count`) without deleting the
+  earlier attempts. An event that had exhausted its retries can therefore fail
+  again up to `max_attempts` times before being dead-lettered again.
+- Replay calls the same processor as normal processing. Because processing is
+  at-least-once, a processor that is unsafe to repeat is also unsafe to replay.
+
+A shared token is not user authentication. It proves the caller knows the
+operator secret, not who they are. Per-user authorization belongs to a later
+stage.
 
 ## Storage
 
@@ -150,6 +269,7 @@ The `events` table:
 | `received_at` | text | When HookWatch stored it, normalised to UTC. |
 | `status` | text | Lifecycle status: `received`, `processing`, `processed` or `failed`. |
 | `dead_lettered_at` | text | When the engine stopped retrying, or null while the event is still eligible. |
+| `replay_count` | integer | How many replay cycles the event has had. `0` until the first replay. |
 
 A unique index on `(source, event_id)` is what enforces idempotency. The insert
 uses `ON CONFLICT (source, event_id) DO NOTHING` and then checks how many rows
@@ -164,6 +284,7 @@ The `attempts` table records one row per processing attempt:
 | `id` | integer | Internal attempt key. |
 | `event_row_id` | integer | The `events.id` this attempt belongs to. |
 | `attempt_number` | integer | 1, 2, 3 and so on within one event. |
+| `replay_number` | integer | The event's `replay_count` when this attempt ran. `0` for the original cycle. |
 | `started_at` | text | When the attempt began, in UTC. |
 | `finished_at` | text | When it ended, or null while it is open. |
 | `outcome` | text | `succeeded`, `failed`, or null while it is open. |
@@ -171,8 +292,24 @@ The `attempts` table records one row per processing attempt:
 | `error` | text | The failure message, when there was one. |
 
 Attempts exist so retries leave a history rather than overwriting a single
-counter. The processing engine writes one row per try and uses the count to
-apply the attempt limit.
+counter. The processing engine writes one row per try and applies the attempt
+limit per replay cycle: it counts rows whose `replay_number` equals the event's
+current `replay_count`. Earlier tries stay visible but no longer consume the
+budget.
+
+The `replays` table is the audit trail for operator replay requests:
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `id` | integer | Internal replay key. |
+| `event_row_id` | integer | The `events.id` that was replayed. |
+| `replay_number` | integer | 1, 2, 3 and so on, matching the event's new `replay_count`. |
+| `requested_at` | text | When the replay was accepted, in UTC. |
+| `requested_by` | text | The `X-Operator` value, or `unspecified`. Not verified. |
+| `reason` | text | The operator's reason, required by the API. |
+
+`(event_row_id, replay_number)` is unique, so a replay request cannot be
+recorded twice for the same cycle.
 
 Timestamps are stored as ISO 8601 text in UTC. SQLite has no datetime type, and
 text in this fixed format sorts correctly. Offsets are converted to UTC first,
@@ -197,13 +334,19 @@ the route. The allowed moves are:
 | `received` | `processing` |
 | `processing` | `processed` or `failed` |
 | `failed` | `processing` (a retry) |
-| `processed` | nothing, it is terminal |
+| `processed` | nothing, it is terminal for ordinary processing |
 
 Any other move raises `InvalidTransitionError`. Starting a second processing run
 on a `processed` event, for example, is refused instead of silently reopening
 finished work. Finishing an attempt that is missing or already finished raises
 `AttemptNotOpenError`, so closing the same attempt twice is a detectable mistake
 rather than a silent overwrite.
+
+Replay is the one explicit exception: it moves a `failed` or `processed` event
+back to `received` and increments `replay_count`, and the next attempt belongs
+to a new cycle. It is not part of `ALLOWED_TRANSITIONS` because it is not an
+ordinary processing step. It is an audited operator operation with its own
+service method, authorization and safeguards.
 
 A failed attempt is classified as `retryable` or `permanent`:
 
@@ -212,9 +355,10 @@ A failed attempt is classified as `retryable` or `permanent`:
   sets `dead_lettered_at`. The event stays `failed`, but the engine stops
   selecting it. The payload and every attempt remain in the database.
 
-The HTTP API only creates `received` events. The processing engine moves them
-through the rest of the lifecycle using the same `EventService` methods that the
-API uses.
+The HTTP API only creates `received` events on ingestion. The processing engine
+moves them through the rest of the lifecycle using the same `EventService`
+methods that the API uses. Replay is the only HTTP operation that moves an
+existing event backwards, and it does so through its own audited path.
 
 ### Migrations
 
@@ -231,6 +375,7 @@ version instead of half upgraded.
 | 2 | Adds `status`, deduplicates any existing rows, then adds the unique index on `(source, event_id)`. |
 | 3 | Creates the `attempts` table. |
 | 4 | Adds `attempts.failure_kind`, `events.dead_lettered_at` and an index on `events.status`. |
+| 5 | Adds `events.replay_count`, `attempts.replay_number` and the `replays` audit table. |
 
 Version 2 deletes all but the oldest row of every duplicate `(source, event_id)`
 pair before creating the unique index, because SQLite refuses to create a unique
@@ -248,7 +393,7 @@ uv run python -m tools.inspect_events --db C:\temp\other.db
 It prints one JSON object per line, newest first:
 
 ```json
-{"id": 2, "source": "github", "event_id": "evt_...", "event_type": "invoice.paid", "occurred_at": "2026-11-08T08:24:54+00:00", "received_at": "2026-11-08T08:24:54+00:00", "status": "processed", "dead_lettered_at": null, "data": {}}
+{"id": 2, "source": "github", "event_id": "evt_...", "event_type": "invoice.paid", "occurred_at": "2026-11-08T08:24:54+00:00", "received_at": "2026-11-08T08:24:54+00:00", "status": "processed", "dead_lettered_at": null, "replay_count": 0, "data": {}}
 ```
 
 If the `sqlite3` command line tool is installed, the same data is available
@@ -265,8 +410,13 @@ Known limits at this stage:
 - There is one engine task per process. Running several uvicorn workers would
   start one each. Claiming is atomic, so events are not processed twice, but
   there is no leader election or shared scheduling yet.
-- There is no HTTP inspection, dead-letter listing or replay. Use
-  `tools/inspect_events.py` to see the stored status and timestamps.
+- Replay uses one shared bearer token. It proves the caller knows the operator
+  secret, not who they are, and the `X-Operator` value is recorded but not
+  verified.
+- Replay re-runs the same processor. It does not make an unsafe side effect
+  safe; at-least-once still applies.
+- Event filtering is exact match on a few columns. There is no full-text search
+  over payloads, dead-letter queue UI or saved filter.
 - The tables grow forever. There is no retention, archival or cleanup.
 - SQL access is confined to `app/repositories/`. Routes and services never see a
   connection or a table name, so replacing SQLite later means rewriting one
@@ -321,8 +471,9 @@ delay = min(backoff_base_seconds * 2^(attempts_so_far - 1), backoff_cap_seconds)
 ```
 
 With the defaults that is 2, 4, 8, 16, 32 and then 60 seconds. The attempt count
-and finish time come from the existing `attempts` table, so no extra retry
-counter column is needed.
+and finish time come from the existing `attempts` table, counted within the
+current replay cycle (`replay_number` equal to `events.replay_count`), so no
+extra retry counter column is needed.
 
 ### Failure classification
 
@@ -346,7 +497,9 @@ is set, and the engine stops selecting the event. Nothing is deleted: the payloa
 and the full attempt history remain available for investigation.
 
 A dead-lettered event keeps the `failed` status. `dead_lettered_at` is what
-distinguishes "failed, will retry" from "failed, given up".
+distinguishes "failed, will retry" from "failed, given up". Replay clears the
+marker and starts a new attempt cycle, so a dead letter can be retried after the
+cause is fixed.
 
 ### Crash recovery
 
@@ -368,7 +521,7 @@ stage.
 | --- | --- | --- |
 | `poll_interval_seconds` | `1.0` | Sleep when a batch had no due work. |
 | `batch_size` | `10` | Maximum events examined in one call. |
-| `max_attempts` | `5` | Attempts before an event is dead-lettered. |
+| `max_attempts` | `5` | Attempts per replay cycle before an event is dead-lettered. |
 | `backoff_base_seconds` | `2.0` | Wait after the first failure. |
 | `backoff_cap_seconds` | `60.0` | Largest wait between attempts. |
 | `stale_after_seconds` | `300.0` | Age at which an open attempt is treated as abandoned. |
@@ -482,17 +635,20 @@ Behaviour worth knowing:
 |   |-- api/
 |   |   |-- __init__.py
 |   |   |-- deps.py       Shared route dependencies
+|   |   |-- events.py     Inspection, filtering and replay endpoints
+|   |   |-- replay_auth.py Replay bearer token check
 |   |   `-- webhooks.py   Webhook receiver endpoint and error logging
 |   |-- db.py             Connections, migrations and row models
 |   |-- engine.py         Background processing loop
 |   |-- lifecycle.py      Event statuses, allowed transitions and failure kinds
-|   |-- main.py           App factory, router, engine startup and logging
+|   |-- main.py           App factory, routers, engine startup and logging
 |   |-- repositories/
 |   |   |-- __init__.py
 |   |   `-- events.py     EventRepository, the only place with event SQL
 |   |-- schemas/
 |   |   |-- __init__.py
-|   |   `-- event.py      WebhookEvent data contract
+|   |   |-- event.py      WebhookEvent data contract
+|   |   `-- inspection.py Response models for monitoring and replay
 |   `-- services/
 |       |-- __init__.py
 |       `-- events.py     EventService and processing policy
@@ -508,6 +664,8 @@ Behaviour worth knowing:
 |   |-- test_idempotency.py    API level duplicate delivery tests
 |   |-- test_processing.py     Retry, backoff, classification and dead-letter tests
 |   |-- test_engine.py         Background loop and FastAPI integration tests
+|   |-- test_monitoring.py     Listing, filtering and detail endpoint tests
+|   |-- test_replay.py         Replay service, authorization and API tests
 |   |-- test_persistence.py    API to database tests and restart behaviour
 |   `-- test_inspect_events.py Inspector tool tests
 |-- tools/
@@ -529,22 +687,22 @@ advance.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `HOOKWATCH_DB_PATH` | `hookwatch.db` | SQLite database file. Read once at startup. |
+| `HOOKWATCH_REPLAY_TOKEN` | unset | Bearer token required by `POST /events/{id}/replay`. Unset disables replay. |
 
 Processing intervals, attempt limits and backoff values are code defaults in
 `ProcessingSettings`. They are not environment variables yet, because deployment
 configuration belongs to the production hardening stage.
 
-Nothing else is configurable yet. There are no secrets and no authentication.
+The replay token is a secret. It is read from the environment at startup and is
+never written to the database or the logs. There is no user authentication yet.
 
 ## Not implemented yet
 
 These are planned but deliberately absent, so nothing here should be assumed to
 exist:
 
-- Event inspection over HTTP and dead-letter listing. Use
-  `tools/inspect_events.py` until then.
-- Event replay
-- Signature verification, rate limiting or authentication
+- Signature verification, ingestion authentication, rate limiting or per-user
+  authorization
 - Payload size limits at the HTTP layer
 - Retention, archival or cleanup of stored events
 - Operational metrics or dashboards

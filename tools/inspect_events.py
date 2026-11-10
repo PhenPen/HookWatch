@@ -1,7 +1,8 @@
 """Print stored webhook events as one JSON object per line.
 
-This is a development tool. It reads the database directly so events can be
-inspected before an HTTP inspection API exists, which arrives in a later stage.
+This is a development tool. It reads the database directly, which is useful
+when the server is not running or when the database file is somewhere else.
+The HTTP API also exposes inspection and replay under /events.
 
 Examples:
 
@@ -46,6 +47,7 @@ def format_event(event: StoredEvent) -> str:
                 if event.dead_lettered_at is not None
                 else None
             ),
+            "replay_count": event.replay_count,
             "data": event.data,
         },
         ensure_ascii=False,

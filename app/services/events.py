@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from app.db import Attempt, StoredEvent
+from app.db import Attempt, Replay, StoredEvent
 from app.lifecycle import (
     AttemptNotOpenError,
     AttemptOutcome,
@@ -21,6 +21,7 @@ from app.lifecycle import (
     FailureKind,
     InvalidTransitionError,
     PermanentProcessingError,
+    ReplayNotAllowedError,
     RetryableProcessingError,
     ensure_transition_allowed,
 )
@@ -82,6 +83,15 @@ class DeliveryResult:
     duplicate: bool
 
 
+@dataclass(frozen=True)
+class EventHistory:
+    """One event together with everything recorded about it."""
+
+    event: StoredEvent
+    attempts: list[Attempt]
+    replays: list[Replay]
+
+
 class EventService:
     def __init__(
         self,
@@ -103,6 +113,97 @@ class EventService:
         record_id, created = self.repository.insert_if_new(source, event)
         return DeliveryResult(record_id=record_id, duplicate=not created)
 
+    def list_events(
+        self,
+        *,
+        source: str | None = None,
+        event_type: str | None = None,
+        status: EventStatus | None = None,
+        dead_lettered: bool | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[StoredEvent]:
+        """Return stored events matching the supplied filters, newest first."""
+        return self.repository.list_filtered(
+            source=source,
+            event_type=event_type,
+            status=status,
+            dead_lettered=dead_lettered,
+            limit=limit,
+            offset=offset,
+        )
+
+    def get_event(self, record_id: int) -> StoredEvent:
+        """Return one event, or raise LookupError when it does not exist."""
+        stored = self.repository.get(record_id)
+        if stored is None:
+            raise LookupError(f"event {record_id} does not exist")
+        return stored
+
+    def get_event_history(self, record_id: int) -> EventHistory:
+        """Return one event with its full attempt and replay history."""
+        stored = self.get_event(record_id)
+        return EventHistory(
+            event=stored,
+            attempts=self.repository.list_attempts(record_id),
+            replays=self.repository.list_replays(record_id),
+        )
+
+    def replay_event(
+        self,
+        record_id: int,
+        *,
+        reason: str,
+        requested_by: str = "unspecified",
+        now: datetime | None = None,
+    ) -> Replay:
+        """Queue an existing event for another processing cycle.
+
+        Replay is not ingestion. It never inserts an event row, so the unique
+        index on (source, event_id) still governs duplicates and a sender
+        redelivering the same event gets the usual duplicate response.
+
+        Only failed or processed events can be replayed. A received event is
+        already waiting for the engine, and a processing event is in flight.
+        The decision is made twice on purpose: here for a clear error message,
+        and in the conditional UPDATE that actually performs the change, so a
+        concurrent replay or claim cannot slip between the two.
+        """
+        stored = self.get_event(record_id)
+
+        if stored.status is EventStatus.PROCESSING:
+            raise ReplayNotAllowedError(
+                f"event {record_id} is currently being processed"
+            )
+        if stored.status is EventStatus.RECEIVED:
+            raise ReplayNotAllowedError(
+                f"event {record_id} is already queued for processing"
+            )
+
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        replay = self.repository.replay(
+            record_id,
+            replay_number=stored.replay_count + 1,
+            requested_at=current,
+            requested_by=requested_by,
+            reason=reason,
+        )
+        if replay is None:
+            raise ReplayNotAllowedError(
+                f"event {record_id} changed while it was being replayed"
+            )
+
+        logger.info(
+            "event queued for replay id=%s source=%s event_id=%s replay_number=%s requested_by=%s reason=%s",
+            record_id,
+            stored.source,
+            stored.event_id,
+            replay.replay_number,
+            requested_by,
+            reason,
+        )
+        return replay
+
     def start_processing(self, record_id: int) -> int:
         """Refuse illegal statuses, then claim the event and open an attempt.
 
@@ -118,10 +219,10 @@ class EventService:
 
         ensure_transition_allowed(stored.status, EventStatus.PROCESSING)
 
-        attempts = self.repository.list_attempts(record_id)
+        attempts_made = self.repository.count_attempts(record_id, stored.replay_count)
         if (
             stored.status is EventStatus.FAILED
-            and len(attempts) >= self.settings.max_attempts
+            and attempts_made >= self.settings.max_attempts
         ):
             raise InvalidTransitionError(
                 f"event {record_id} has exhausted its attempts"
@@ -187,22 +288,23 @@ class EventService:
         handled = 0
 
         for event in self.repository.list_pending(limit=self.settings.batch_size):
-            attempts = self.repository.list_attempts(event.id)
+            cycle_attempts = self._cycle_attempts(event)
 
             if event.status is EventStatus.FAILED:
-                if len(attempts) >= self.settings.max_attempts:
+                if len(cycle_attempts) >= self.settings.max_attempts:
                     if self.repository.mark_dead_letter(event.id, at=current):
                         logger.warning(
-                            "event dead-lettered after %s attempts id=%s source=%s event_id=%s",
-                            len(attempts),
+                            "event dead-lettered after %s attempts in cycle id=%s source=%s event_id=%s replay=%s",
+                            len(cycle_attempts),
                             event.id,
                             event.source,
                             event.event_id,
+                            event.replay_count,
                         )
                         handled += 1
                     continue
 
-                if not self._retry_due(attempts, current):
+                if not self._retry_due(cycle_attempts, current):
                     continue
 
             attempt_id = self.repository.claim(event.id, started_at=current)
@@ -211,10 +313,12 @@ class EventService:
                 continue
 
             attempt = self.repository.get_attempt(attempt_id)
-            attempt_number = attempt.attempt_number if attempt is not None else 1
+            attempts_made = self.repository.count_attempts(
+                event.id, event.replay_count
+            )
 
             handled += 1
-            self._run_attempt(event, attempt_id, attempt_number, current)
+            self._run_attempt(event, attempt_id, attempt, attempts_made, current)
 
         return handled
 
@@ -229,6 +333,18 @@ class EventService:
         if recovered:
             logger.warning("recovered %s abandoned processing attempt(s)", recovered)
         return recovered
+
+    def _cycle_attempts(self, event: StoredEvent) -> list[Attempt]:
+        """Attempts made since the last replay, which is what the limit counts.
+
+        Earlier attempts stay in the database for inspection, but they belong
+        to previous cycles and must not consume the new budget.
+        """
+        return [
+            attempt
+            for attempt in self.repository.list_attempts(event.id)
+            if attempt.replay_number == event.replay_count
+        ]
 
     def _retry_due(self, attempts: list[Attempt], now: datetime) -> bool:
         """Whether a failed event has waited long enough for another try."""
@@ -248,11 +364,12 @@ class EventService:
         self,
         event: StoredEvent,
         attempt_id: int,
-        attempt_number: int,
+        attempt: Attempt | None,
+        attempts_made: int,
         now: datetime,
     ) -> None:
         """Run the processor once and record what happened."""
-        exhausted = attempt_number >= self.settings.max_attempts
+        exhausted = attempts_made >= self.settings.max_attempts
 
         try:
             self.processor(event)
@@ -294,11 +411,12 @@ class EventService:
         else:
             self.finish_processing(attempt_id, succeeded=True, finished_at=now)
             logger.info(
-                "event processed id=%s source=%s event_id=%s attempt=%s",
+                "event processed id=%s source=%s event_id=%s attempt=%s replay=%s",
                 event.id,
                 event.source,
                 event.event_id,
-                attempt_number,
+                attempt.attempt_number if attempt is not None else attempts_made,
+                event.replay_count,
             )
 
     def _record_failure(
