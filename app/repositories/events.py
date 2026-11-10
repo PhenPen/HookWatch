@@ -1,7 +1,7 @@
 """Database access for webhook events and processing attempts.
 
-All SQL for events lives here. Routes, services and later the MCP layer call
-these methods and never see a connection, a cursor or a table name. That
+All SQL for events lives here. Routes, services and the MCP server call these
+methods and never see a connection, a cursor or a table name. That
 boundary is what makes it possible to replace SQLite with another database
 without rewriting request handling.
 """

@@ -1,7 +1,7 @@
 """Event lifecycle: the statuses an event can have and the moves allowed.
 
-These rules are transport independent. The HTTP API, and later the MCP layer,
-both go through the same service, so the rules must not live in a route.
+These rules are transport independent. The HTTP API and the MCP layer both go
+through the same service, so the rules must not live in a route.
 """
 
 from enum import StrEnum

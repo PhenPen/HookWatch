@@ -1,8 +1,8 @@
-"""Read models for the monitoring and replay endpoints.
+"""Read models for monitoring, replay and MCP.
 
 These are response contracts, not database rows and not request payloads. They
-exist so the HTTP API documents exactly what it returns and so the shape can be
-reused by the MCP layer later without copying dictionaries around.
+exist so the HTTP API documents exactly what it returns and so the MCP layer
+reuses the same shape without copying dictionaries around.
 """
 
 from datetime import datetime
@@ -56,6 +56,22 @@ class EventDetail(EventSummary):
     """One event with its payload, attempts and replay audit trail."""
 
     data: dict[str, Any]
+    attempts: list[AttemptView]
+    replays: list[ReplayView]
+
+
+class ProcessingHistory(BaseModel):
+    """What happened to one event, without repeating its payload.
+
+    This is the shape an operator reads when the question is "why did this
+    fail?" rather than "what did the sender send?".
+    """
+
+    id: int
+    source: str
+    event_id: str
+    status: EventStatus
+    replay_count: int
     attempts: list[AttemptView]
     replays: list[ReplayView]
 

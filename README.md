@@ -4,9 +4,9 @@ Webhook monitoring and management system with an MCP interface.
 
 HookWatch receives webhook events, validates them, stores them and tracks their
 processing lifecycle so that failed deliveries can be investigated and
-recovered. The same application services will eventually be exposed to AI
-agents through an MCP server, without duplicating business logic between the
-HTTP API and the MCP layer.
+recovered. The same application services are exposed to AI agents through a
+read-only MCP server, without duplicating business logic between the HTTP API
+and the MCP layer.
 
 The authoritative specification and staged roadmap are kept in a local
 `hookwatch_implementation.md` document. It is intentionally not tracked in Git,
@@ -14,17 +14,18 @@ so it will not appear in a fresh clone of this repository.
 
 ## Status
 
-Stage 7 (monitoring and event replay) is complete. The application starts, serves
-a health check, validates webhook event envelopes, accepts them at
-`POST /webhooks/{source}` and stores them in SQLite before responding, so
-events survive a restart. A redelivered event is detected and acknowledged
-without creating a second row, and every event carries a lifecycle status. An
-in-process engine processes stored events, retries temporary failures with
-exponential backoff, classifies permanent failures and dead-letters events that
-will not be retried. Events, attempts and replay history can be inspected over
-HTTP with filters, and failed or processed events can be queued for another
-processing cycle by an operator holding the replay token. Stages are implemented
-one at a time, and each stage is committed separately.
+Stage 8 (MCP server) is complete. The application starts, serves a health check,
+validates webhook event envelopes, accepts them at `POST /webhooks/{source}` and
+stores them in SQLite before responding, so events survive a restart. A
+redelivered event is detected and acknowledged without creating a second row,
+and every event carries a lifecycle status. An in-process engine processes
+stored events, retries temporary failures with exponential backoff, classifies
+permanent failures and dead-letters events that will not be retried. Events,
+attempts and replay history can be inspected over HTTP with filters, and failed
+or processed events can be queued for another processing cycle by an operator
+holding the replay token. A separate read-only MCP server exposes the same
+listings, detail and processing history over stdio. Stages are implemented one
+at a time, and each stage is committed separately.
 
 | Stage | Scope | Status |
 | --- | --- | --- |
@@ -36,7 +37,7 @@ one at a time, and each stage is committed separately.
 | 5 | Event lifecycle and idempotency | Complete |
 | 6 | Processing engine | Complete |
 | 7 | Monitoring and event replay | Complete |
-| 8 | MCP server | Not started |
+| 8 | MCP server | Complete |
 | 9 | AI agent integration | Not started |
 | 10 | Production hardening | Not started |
 
@@ -244,6 +245,79 @@ Safeguards, and why they exist:
 A shared token is not user authentication. It proves the caller knows the
 operator secret, not who they are. Per-user authorization belongs to a later
 stage.
+
+## MCP server
+
+The inspection features are also available over the Model Context Protocol, so
+an MCP-compatible AI client can read stored events without going through HTTP.
+The server lives in `app/mcp_server.py` and speaks stdio:
+
+```shell
+uv run python -m app.mcp_server
+```
+
+A client launches it as a child process. A typical configuration entry:
+
+```json
+{
+  "mcpServers": {
+    "hookwatch": {
+      "command": "uv",
+      "args": ["run", "python", "-m", "app.mcp_server"],
+      "cwd": "C:/path/to/Hookwatch",
+      "env": {
+        "HOOKWATCH_DB_PATH": "C:/path/to/Hookwatch/hookwatch.db"
+      }
+    }
+  }
+}
+```
+
+`cwd` must be the project root so `uv` finds `pyproject.toml`, and
+`HOOKWATCH_DB_PATH` must point at the database the web application writes to.
+Relative paths resolve against the working directory. Start the web application
+separately: the MCP process opens the same file directly and never runs its own
+processing engine, so processing still has one owner.
+
+### Tools
+
+| Tool | Arguments | Returns |
+| --- | --- | --- |
+| `list_events` | `source`, `event_type`, `status`, `dead_lettered`, `limit` (1-200, default 50), `offset` | Event summaries, newest first. |
+| `get_event` | `record_id` | One event with payload, attempts and replay audit trail. |
+| `search_failed_events` | `source`, `event_type`, `dead_lettered`, `limit`, `offset` | Failed events only, newest first. |
+| `inspect_processing_history` | `record_id` | Attempts and replays without the payload. |
+
+Filters are exact matches and combine with AND, exactly like `GET /events`.
+`dead_lettered: true` means the engine has given up on the event;
+`dead_lettered: false` means the failure is still eligible for a retry;
+omitting it returns both.
+
+Tools return structured content plus text blocks, so clients that read either
+form get the same data. The response models are shared with the HTTP API, with
+`ProcessingHistory` added for the history-only view, and `app/views.py` builds
+them for both interfaces. Every tool calls `EventService`; no SQL or business
+rule is duplicated in the MCP module.
+
+### Resource
+
+`hookwatch://events/{record_id}` returns the same detail view as `get_event` as
+JSON. Tools are the primary interface; the resource exists for clients that
+prefer reading a URI.
+
+### Behaviour
+
+- The server applies pending migrations when it starts. After that it only
+  reads: no tool inserts, updates or deletes rows.
+- An unknown id is a tool error with the message `event N does not exist`.
+  Invalid arguments are rejected by the input schema before the service runs.
+  Unexpected failures are logged and reported without exposing SQL or a stack
+  trace.
+- Replay is deliberately not exposed over MCP. It is a mutating operator action
+  that needs an authorization contract, which belongs to the AI agent
+  integration stage.
+- The transport is stdio only. The server is meant to be launched by a local
+  client, not exposed on a network socket.
 
 ## Storage
 
@@ -591,6 +665,10 @@ The API test fixtures disable the background engine with
 state are deterministic. Engine tests start it explicitly or drive the service
 directly.
 
+The MCP tests use the SDK's in-memory client against a temporary seeded
+database. They cover tool discovery, structured results, filtering, paging,
+unknown ids, invalid arguments, the processing history view and resource reads.
+
 ## Event data contract
 
 Webhook events share one envelope, defined in `app/schemas/event.py` by the
@@ -642,16 +720,18 @@ Behaviour worth knowing:
 |   |-- engine.py         Background processing loop
 |   |-- lifecycle.py      Event statuses, allowed transitions and failure kinds
 |   |-- main.py           App factory, routers, engine startup and logging
+|   |-- mcp_server.py     Read-only MCP server over stdio
 |   |-- repositories/
 |   |   |-- __init__.py
 |   |   `-- events.py     EventRepository, the only place with event SQL
 |   |-- schemas/
 |   |   |-- __init__.py
 |   |   |-- event.py      WebhookEvent data contract
-|   |   `-- inspection.py Response models for monitoring and replay
-|   `-- services/
-|       |-- __init__.py
-|       `-- events.py     EventService and processing policy
+|   |   `-- inspection.py Response models for monitoring, replay and MCP
+|   |-- services/
+|   |   |-- __init__.py
+|   |   `-- events.py     EventService and processing policy
+|   `-- views.py          Shared row-to-response mapping for HTTP and MCP
 |-- tests/
 |   |-- conftest.py            Shared app and client fixtures on a temp database
 |   |-- test_health.py         Health endpoint test
@@ -666,6 +746,7 @@ Behaviour worth knowing:
 |   |-- test_engine.py         Background loop and FastAPI integration tests
 |   |-- test_monitoring.py     Listing, filtering and detail endpoint tests
 |   |-- test_replay.py         Replay service, authorization and API tests
+|   |-- test_mcp_server.py     MCP tool discovery, results and resource tests
 |   |-- test_persistence.py    API to database tests and restart behaviour
 |   `-- test_inspect_events.py Inspector tool tests
 |-- tools/
@@ -678,16 +759,20 @@ Behaviour worth knowing:
 ```
 
 The package layout is intentionally minimal. The business rules live in
-`app/services/` so the HTTP API and the future MCP server can call the same
-methods. Directories for MCP will be added when a stage needs them, not in
-advance.
+`app/services/` so the HTTP API and the MCP server call the same methods.
+`app/views.py` is the single mapping from stored rows to the response models
+both interfaces return.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `HOOKWATCH_DB_PATH` | `hookwatch.db` | SQLite database file. Read once at startup. |
+| `HOOKWATCH_DB_PATH` | `hookwatch.db` | SQLite database file. Read once at startup by each process. |
 | `HOOKWATCH_REPLAY_TOKEN` | unset | Bearer token required by `POST /events/{id}/replay`. Unset disables replay. |
+
+Both the web application and the MCP server read `HOOKWATCH_DB_PATH`; they must
+use the same path for the MCP tools to see the events the API stored. The MCP
+server does not use the replay token because it cannot replay.
 
 Processing intervals, attempt limits and backoff values are code defaults in
 `ProcessingSettings`. They are not environment variables yet, because deployment
@@ -706,4 +791,6 @@ exist:
 - Payload size limits at the HTTP layer
 - Retention, archival or cleanup of stored events
 - Operational metrics or dashboards
-- MCP tools and resources
+- Replay or any other mutating tool over MCP
+- MCP transports other than stdio, MCP authentication and resource subscriptions
+- MCP client configuration and agent workflows (Stage 9)

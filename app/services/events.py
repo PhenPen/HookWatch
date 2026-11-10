@@ -1,8 +1,7 @@
 """Application rules for receiving and processing webhook events.
 
-This layer is the shared entry point for every interface. The HTTP API uses it
-now; the MCP server will use the same methods in a later stage instead of
-reimplementing the rules.
+This layer is the shared entry point for every interface. The HTTP API and the
+MCP server both call these methods instead of reimplementing the rules.
 
 It owns decisions, the repository owns SQL, and no transport concerns appear
 here: nothing in this module knows about requests or responses.

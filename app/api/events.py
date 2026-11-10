@@ -2,7 +2,7 @@
 
 Listing and detail routes are read-only. The replay route is the only one that
 changes an event's status, and it goes through EventService like every other
-interface so the MCP server can reuse the same rules later.
+interface so the MCP server reuses the same rules.
 """
 
 from typing import Annotated
@@ -11,17 +11,15 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 
 from app.api.deps import get_event_service
 from app.api.replay_auth import require_replay_token
-from app.db import Attempt, Replay, StoredEvent
 from app.lifecycle import EventStatus, ReplayNotAllowedError
 from app.schemas.inspection import (
-    AttemptView,
     EventDetail,
     EventSummary,
     ReplayRequest,
     ReplayResponse,
-    ReplayView,
 )
-from app.services.events import EventHistory, EventService
+from app.services.events import EventService
+from app.views import event_detail, event_summary
 
 router = APIRouter(prefix="/events", tags=["events"])
 
@@ -59,51 +57,6 @@ Operator = Annotated[
 ]
 
 
-def _attempt_view(attempt: Attempt) -> AttemptView:
-    return AttemptView(
-        attempt_number=attempt.attempt_number,
-        replay_number=attempt.replay_number,
-        started_at=attempt.started_at,
-        finished_at=attempt.finished_at,
-        outcome=attempt.outcome,
-        failure_kind=attempt.failure_kind,
-        error=attempt.error,
-    )
-
-
-def _replay_view(replay: Replay) -> ReplayView:
-    return ReplayView(
-        replay_number=replay.replay_number,
-        requested_at=replay.requested_at,
-        requested_by=replay.requested_by,
-        reason=replay.reason,
-    )
-
-
-def _summary(event: StoredEvent) -> EventSummary:
-    return EventSummary(
-        id=event.id,
-        source=event.source,
-        event_id=event.event_id,
-        event_type=event.event_type,
-        occurred_at=event.occurred_at,
-        received_at=event.received_at,
-        status=event.status,
-        dead_lettered_at=event.dead_lettered_at,
-        replay_count=event.replay_count,
-    )
-
-
-def _detail(history: EventHistory) -> EventDetail:
-    summary = _summary(history.event)
-    return EventDetail(
-        **summary.model_dump(),
-        data=history.event.data,
-        attempts=[_attempt_view(attempt) for attempt in history.attempts],
-        replays=[_replay_view(replay) for replay in history.replays],
-    )
-
-
 @router.get("", response_model=list[EventSummary])
 def list_events(
     service: Annotated[EventService, Depends(get_event_service)],
@@ -127,7 +80,7 @@ def list_events(
         limit=limit,
         offset=offset,
     )
-    return [_summary(event) for event in events]
+    return [event_summary(event) for event in events]
 
 
 @router.get("/{record_id}", response_model=EventDetail)
@@ -148,7 +101,7 @@ def get_event(
             detail=str(error),
         ) from error
 
-    return _detail(history)
+    return event_detail(history)
 
 
 @router.post(
