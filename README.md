@@ -15,8 +15,9 @@ so it will not appear in a fresh clone of this repository.
 ## Status
 
 Stage 9 (AI agent integration) is complete. The application starts, serves a
-health check, validates webhook event envelopes, accepts them at `POST /webhooks/{source}` and
-stores them in SQLite before responding, so events survive a restart. A
+health check, validates webhook event envelopes, accepts them at
+`POST /webhooks/{source}` and stores them in SQLite before responding, so events
+survive a restart. A
 redelivered event is detected and acknowledged without creating a second row,
 and every event carries a lifecycle status. An in-process engine processes
 stored events, retries temporary failures with exponential backoff, classifies
@@ -28,6 +29,8 @@ detail and processing history over stdio, and can also queue an event for
 replay when its process holds the replay token. Replay is annotated as
 destructive, so clients such as Hermes require approval before running it.
 Stages are implemented one at a time, and each stage is committed separately.
+Stage 10 (production hardening) is in progress: the web process now loads and
+validates its configuration from the environment before it starts.
 
 | Stage | Scope | Status |
 | --- | --- | --- |
@@ -41,7 +44,7 @@ Stages are implemented one at a time, and each stage is committed separately.
 | 7 | Monitoring and event replay | Complete |
 | 8 | MCP server | Complete |
 | 9 | AI agent integration | Complete |
-| 10 | Production hardening | Not started |
+| 10 | Production hardening | In progress (configuration) |
 
 ## Requirements
 
@@ -686,18 +689,18 @@ abandoned attempt counts toward the limit, because a crash is a failed attempt.
 
 ### Settings
 
-Processing settings are code defaults in `app/services/events.py`, not
-environment variables yet. Configuration for deployment belongs to a later
-stage.
+The engine reads its values from `ProcessingSettings`. In the web process they
+are filled from the `HOOKWATCH_*` variables listed under
+[Configuration](#configuration). The defaults are:
 
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| `poll_interval_seconds` | `1.0` | Sleep when a batch had no due work. |
-| `batch_size` | `10` | Maximum events examined in one call. |
-| `max_attempts` | `5` | Attempts per replay cycle before an event is dead-lettered. |
-| `backoff_base_seconds` | `2.0` | Wait after the first failure. |
-| `backoff_cap_seconds` | `60.0` | Largest wait between attempts. |
-| `stale_after_seconds` | `300.0` | Age at which an open attempt is treated as abandoned. |
+| Internal setting | Environment variable | Default | Meaning |
+| --- | --- | --- | --- |
+| `poll_interval_seconds` | `HOOKWATCH_POLL_INTERVAL_SECONDS` | `1.0` | Sleep when a batch had no due work. |
+| `batch_size` | `HOOKWATCH_BATCH_SIZE` | `10` | Maximum events examined in one call. |
+| `max_attempts` | `HOOKWATCH_MAX_ATTEMPTS` | `5` | Attempts per replay cycle before an event is dead-lettered. |
+| `backoff_base_seconds` | `HOOKWATCH_BACKOFF_BASE_SECONDS` | `2.0` | Wait after the first failure. |
+| `backoff_cap_seconds` | `HOOKWATCH_BACKOFF_CAP_SECONDS` | `60.0` | Largest wait between attempts. |
+| `stale_after_seconds` | `HOOKWATCH_STALE_AFTER_SECONDS` | `300.0` | Age at which an open attempt is treated as abandoned. |
 
 ## Webhook simulator
 
@@ -759,10 +762,14 @@ default.
 uv run pytest
 ```
 
-The API test fixtures disable the background engine with
-`create_app(..., start_engine=False)`, so assertions about the initial `received`
-state are deterministic. Engine tests start it explicitly or drive the service
-directly.
+The API test fixtures build an explicit `Settings` with
+`engine_enabled=False`, so no test depends on the environment and assertions
+about the initial `received` state are deterministic. Engine tests enable it
+explicitly or drive the service directly.
+
+`tests/test_settings.py` covers environment parsing, boolean spellings, blank
+values falling back to defaults, rejected values, and the rule that the replay
+token never appears in the settings repr.
 
 The MCP tests use the SDK's in-memory client against a temporary seeded
 database. They cover tool discovery, structured results, filtering, paging,
@@ -833,6 +840,7 @@ Behaviour worth knowing:
 |   |-- services/
 |   |   |-- __init__.py
 |   |   `-- events.py     EventService and processing policy
+|   |-- settings.py       Validated environment configuration
 |   `-- views.py          Shared row-to-response mapping for HTTP and MCP
 |-- tests/
 |   |-- conftest.py            Shared app and client fixtures on a temp database
@@ -848,6 +856,7 @@ Behaviour worth knowing:
 |   |-- test_engine.py         Background loop and FastAPI integration tests
 |   |-- test_monitoring.py     Listing, filtering and detail endpoint tests
 |   |-- test_replay.py         Replay service, authorization and API tests
+|   |-- test_settings.py       Configuration parsing and validation tests
 |   |-- test_mcp_server.py     MCP tools, replay gating, approval hints and resource tests
 |   |-- test_persistence.py    API to database tests and restart behaviour
 |   `-- test_inspect_events.py Inspector tool tests
@@ -867,24 +876,52 @@ both interfaces return.
 
 ## Configuration
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `HOOKWATCH_DB_PATH` | `hookwatch.db` | SQLite database file. Read once at startup by each process. |
-| `HOOKWATCH_REPLAY_TOKEN` | unset | Enables replay. Required by `POST /events/{id}/replay` and by the MCP `replay_event` tool. Unset disables replay in both interfaces. |
-| `HOOKWATCH_MCP_OPERATOR` | `mcp-agent` | Name recorded as `requested_by` in the replay audit trail for MCP calls. |
+The web process reads its configuration from environment variables once at
+startup, through `app/settings.py`. Values are validated before the application
+or the engine starts. An invalid value stops startup with a message that names
+the problem, rather than silently falling back to a default.
 
-Both the web application and the MCP server read `HOOKWATCH_DB_PATH`; they must
-use the same path for the MCP tools to see the events the API stored. The MCP
-server also reads `HOOKWATCH_REPLAY_TOKEN` to decide whether to register
-`replay_event`, and `HOOKWATCH_MCP_OPERATOR` to name itself in the audit trail.
+| Variable | Default | Applies to | Meaning |
+| --- | --- | --- | --- |
+| `HOOKWATCH_DB_PATH` | `hookwatch.db` | both processes | SQLite database file. |
+| `HOOKWATCH_REPLAY_TOKEN` | unset | both processes | Enables replay. Required by `POST /events/{id}/replay` and by the MCP `replay_event` tool. Unset or blank disables replay. |
+| `HOOKWATCH_ENGINE_ENABLED` | `true` | web | Start the in-process processing engine. |
+| `HOOKWATCH_LOG_LEVEL` | `INFO` | web | Root log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. |
+| `HOOKWATCH_POLL_INTERVAL_SECONDS` | `1.0` | web | Wait before the next pass when nothing was due. |
+| `HOOKWATCH_BATCH_SIZE` | `10` | web | Maximum events examined per pass. |
+| `HOOKWATCH_MAX_ATTEMPTS` | `5` | web | Attempts per replay cycle before an event is dead-lettered. |
+| `HOOKWATCH_BACKOFF_BASE_SECONDS` | `2.0` | web | Delay after the first retryable failure. |
+| `HOOKWATCH_BACKOFF_CAP_SECONDS` | `60.0` | web | Maximum backoff delay. Must be at least the base. |
+| `HOOKWATCH_STALE_AFTER_SECONDS` | `300.0` | web | Age at which an open attempt is treated as abandoned. |
+| `HOOKWATCH_MCP_OPERATOR` | `mcp-agent` | MCP | Name recorded as `requested_by` in the replay audit trail. |
 
-Processing intervals, attempt limits and backoff values are code defaults in
-`ProcessingSettings`. They are not environment variables yet, because deployment
-configuration belongs to the production hardening stage.
+Booleans accept `true`, `false`, `1`, `0`, `yes`, `no`, `on` and `off`,
+case-insensitive. Blank values fall back to the default. Numeric values must be
+finite; `nan` and `inf` are rejected, as are zero or negative intervals, a zero
+batch size, zero attempts, and a backoff cap below the base.
+
+Both processes read `HOOKWATCH_DB_PATH`; they must use the same path for the MCP
+tools to see the events the API stored. The MCP server also reads
+`HOOKWATCH_REPLAY_TOKEN` to decide whether to register `replay_event`, and
+`HOOKWATCH_MCP_OPERATOR` to name itself in the audit trail.
+
+### Running more than one worker
+
+If uvicorn runs several workers, each process would otherwise start its own
+polling loop. The database claim keeps processing correct, but the loops are
+redundant. Choose one shape:
+
+- one worker, engine enabled;
+- several workers, plus one process with `HOOKWATCH_ENGINE_ENABLED=true` and the
+  rest with it set to `false`.
+
+Configuration is read once at startup. Changing an environment variable requires
+a restart; there is no config file and no reload at runtime.
 
 The replay token is a secret. It is read from the environment at startup and is
-never written to the database, the logs or an MCP tool argument. There is no
-user authentication yet.
+never written to the database, the logs or an MCP tool argument. The settings
+object also hides it from its `repr`, so logging the settings does not print it.
+There is no user authentication yet.
 
 ## Not implemented yet
 
@@ -900,3 +937,5 @@ exist:
 - MCP transports other than stdio, MCP authentication and resource subscriptions
 - Approval enforced by HookWatch itself; approval currently depends on the MCP
   client honouring the tool annotations
+- Configuration files (YAML or TOML); only environment variables are supported
+- Hot reload of configuration values; a restart is required

@@ -7,10 +7,8 @@ Run locally with:
 
 import asyncio
 import logging
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -21,65 +19,47 @@ from app.api.webhooks import router as webhooks_router
 from app.db import migrate
 from app.engine import run_forever
 from app.repositories.events import EventRepository
-from app.services.events import EventService, ProcessingSettings
-
-# uvicorn configures only its own loggers, so without this the application's
-# INFO messages would be dropped silently. Structured logging is left to the
-# production hardening stage.
-logging.basicConfig(level=logging.INFO)
+from app.services.events import EventService
+from app.settings import Settings
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DATABASE_PATH = Path("hookwatch.db")
 
-
-def create_app(
-    database_path: Path | None = None,
-    *,
-    start_engine: bool = True,
-    settings: ProcessingSettings | None = None,
-    replay_token: str | None = None,
-) -> FastAPI:
+def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the application.
 
-    The database path is a parameter so tests can use a temporary file and never
-    touch the development database. The module level app below is the normal
-    entry point for uvicorn.
-
-    Tests that inspect stored rows set start_engine to False. Otherwise the
-    background loop would process events while a test is asserting on their
-    initial received state.
-
-    replay_token is the shared secret that enables replay. Passing an empty
-    string disables replay explicitly, which is how tests prove the closed
-    default even on a machine where the environment variable is set.
+    Configuration is a Settings object so tests can build one explicitly and
+    never depend on the environment. Without one, Settings.from_env() reads and
+    validates the HOOKWATCH_* variables, so a bad value stops startup instead
+    of failing later inside a request or the engine.
     """
-    path = database_path or Path(
-        os.environ.get("HOOKWATCH_DB_PATH", str(DEFAULT_DATABASE_PATH))
-    )
-    processing_settings = settings or ProcessingSettings()
-    token = (
-        replay_token
-        if replay_token is not None
-        else os.environ.get("HOOKWATCH_REPLAY_TOKEN") or None
-    )
+    config = settings or Settings.from_env()
+
+    # uvicorn configures only its own loggers, so without this the application's
+    # INFO messages would be dropped silently. Structured logging is left to a
+    # later stage.
+    logging.basicConfig(level=config.log_level)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        applied = migrate(path)
+        applied = migrate(config.database_path)
         if applied:
-            logger.info("applied %s database migration(s) to %s", applied, path)
+            logger.info(
+                "applied %s database migration(s) to %s",
+                applied,
+                config.database_path,
+            )
 
-        repository = EventRepository(path)
-        service = EventService(repository, settings=processing_settings)
+        repository = EventRepository(config.database_path)
+        service = EventService(repository, settings=config.processing)
         app.state.events = repository
         app.state.event_service = service
-        app.state.settings = processing_settings
-        app.state.replay_token = token
+        app.state.settings = config.processing
+        app.state.replay_token = config.replay_token
 
         stop = asyncio.Event()
         engine_task: asyncio.Task[None] | None = None
-        if start_engine:
+        if config.engine_enabled:
             engine_task = asyncio.create_task(run_forever(service, stop))
 
         try:

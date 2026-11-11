@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.settings import Settings
 
 
 @pytest.fixture
@@ -15,8 +16,14 @@ def database_path(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def app(database_path: Path) -> FastAPI:
-    return create_app(database_path, start_engine=False)
+def settings(database_path: Path) -> Settings:
+    """Explicit configuration, so tests never depend on the environment."""
+    return Settings(database_path=database_path, engine_enabled=False)
+
+
+@pytest.fixture
+def app(settings: Settings) -> FastAPI:
+    return create_app(settings)
 
 
 @pytest.fixture

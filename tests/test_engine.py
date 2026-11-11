@@ -9,6 +9,7 @@ from app.engine import run_forever
 from app.lifecycle import EventStatus
 from app.main import create_app
 from app.services.events import ProcessingSettings
+from app.settings import Settings
 
 VALID_EVENT: dict[str, Any] = {
     "event_id": "evt_engine",
@@ -84,8 +85,12 @@ def test_loop_stops_promptly_when_idle() -> None:
 
 
 def test_engine_processes_events_inside_fastapi(database_path: Path) -> None:
-    settings = ProcessingSettings(poll_interval_seconds=0.01)
-    app = create_app(database_path, start_engine=True, settings=settings)
+    settings = Settings(
+        database_path=database_path,
+        engine_enabled=True,
+        processing=ProcessingSettings(poll_interval_seconds=0.01),
+    )
+    app = create_app(settings)
 
     with TestClient(app) as client:
         response = client.post("/webhooks/github", json=VALID_EVENT)
@@ -105,7 +110,7 @@ def test_engine_processes_events_inside_fastapi(database_path: Path) -> None:
 
 
 def test_engine_can_be_disabled(database_path: Path) -> None:
-    app = create_app(database_path, start_engine=False)
+    app = create_app(Settings(database_path=database_path, engine_enabled=False))
 
     with TestClient(app) as client:
         response = client.post("/webhooks/github", json=VALID_EVENT)

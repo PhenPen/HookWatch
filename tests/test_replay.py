@@ -15,6 +15,7 @@ from app.main import create_app
 from app.repositories.events import EventRepository
 from app.schemas.event import WebhookEvent
 from app.services.events import EventService, ProcessingSettings
+from app.settings import Settings
 
 NOW = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
 AUTH = {"Authorization": "Bearer replay-secret"}
@@ -237,7 +238,13 @@ def test_get_event_history_rejects_an_unknown_id(
 
 @pytest.fixture
 def replay_app(database_path: Path):
-    return create_app(database_path, start_engine=False, replay_token="replay-secret")
+    return create_app(
+        Settings(
+            database_path=database_path,
+            engine_enabled=False,
+            replay_token="replay-secret",
+        )
+    )
 
 
 @pytest.fixture
@@ -269,7 +276,13 @@ def mark_processed(client: TestClient, record_id: int) -> None:
 
 
 def test_replay_requires_a_configured_token(database_path: Path) -> None:
-    app = create_app(database_path, start_engine=False, replay_token="")
+    app = create_app(
+        Settings(
+            database_path=database_path,
+            engine_enabled=False,
+            replay_token="",
+        )
+    )
 
     with TestClient(app) as client:
         record_id = post_event(client)

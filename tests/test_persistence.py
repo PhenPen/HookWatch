@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.settings import Settings
 
 VALID_EVENT: dict[str, Any] = {
     "event_id": "evt_123",
@@ -70,13 +71,17 @@ def test_events_are_scoped_by_source(client: TestClient, app: FastAPI) -> None:
 
 
 def test_events_survive_an_application_restart(database_path: Path) -> None:
-    first_app = create_app(database_path, start_engine=False)
+    first_app = create_app(
+        Settings(database_path=database_path, engine_enabled=False)
+    )
     with TestClient(first_app) as first_client:
         response = first_client.post("/webhooks/github", json=VALID_EVENT)
         assert response.status_code == 202
 
     # A fresh application object on the same file stands in for a restart.
-    second_app = create_app(database_path, start_engine=False)
+    second_app = create_app(
+        Settings(database_path=database_path, engine_enabled=False)
+    )
     with TestClient(second_app) as second_client:
         assert second_client.get("/health").status_code == 200
 
