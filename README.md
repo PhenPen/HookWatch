@@ -4,9 +4,9 @@ Webhook monitoring and management system with an MCP interface.
 
 HookWatch receives webhook events, validates them, stores them and tracks their
 processing lifecycle so that failed deliveries can be investigated and
-recovered. The same application services are exposed to AI agents through a
-read-only MCP server, without duplicating business logic between the HTTP API
-and the MCP layer.
+recovered. The same application services are exposed to AI agents through an
+MCP server that stays read-only unless a replay token is configured, without
+duplicating business logic between the HTTP API and the MCP layer.
 
 The authoritative specification and staged roadmap are kept in a local
 `hookwatch_implementation.md` document. It is intentionally not tracked in Git,
@@ -14,8 +14,8 @@ so it will not appear in a fresh clone of this repository.
 
 ## Status
 
-Stage 8 (MCP server) is complete. The application starts, serves a health check,
-validates webhook event envelopes, accepts them at `POST /webhooks/{source}` and
+Stage 9 (AI agent integration) is complete. The application starts, serves a
+health check, validates webhook event envelopes, accepts them at `POST /webhooks/{source}` and
 stores them in SQLite before responding, so events survive a restart. A
 redelivered event is detected and acknowledged without creating a second row,
 and every event carries a lifecycle status. An in-process engine processes
@@ -23,9 +23,11 @@ stored events, retries temporary failures with exponential backoff, classifies
 permanent failures and dead-letters events that will not be retried. Events,
 attempts and replay history can be inspected over HTTP with filters, and failed
 or processed events can be queued for another processing cycle by an operator
-holding the replay token. A separate read-only MCP server exposes the same
-listings, detail and processing history over stdio. Stages are implemented one
-at a time, and each stage is committed separately.
+holding the replay token. A separate MCP server exposes the same listings,
+detail and processing history over stdio, and can also queue an event for
+replay when its process holds the replay token. Replay is annotated as
+destructive, so clients such as Hermes require approval before running it.
+Stages are implemented one at a time, and each stage is committed separately.
 
 | Stage | Scope | Status |
 | --- | --- | --- |
@@ -38,7 +40,7 @@ at a time, and each stage is committed separately.
 | 6 | Processing engine | Complete |
 | 7 | Monitoring and event replay | Complete |
 | 8 | MCP server | Complete |
-| 9 | AI agent integration | Not started |
+| 9 | AI agent integration | Complete |
 | 10 | Production hardening | Not started |
 
 ## Requirements
@@ -248,9 +250,9 @@ stage.
 
 ## MCP server
 
-The inspection features are also available over the Model Context Protocol, so
-an MCP-compatible AI client can read stored events without going through HTTP.
-The server lives in `app/mcp_server.py` and speaks stdio:
+Inspection and controlled replay are also available over the Model Context
+Protocol, so an MCP-compatible AI client can work with stored events without
+going through HTTP. The server lives in `app/mcp_server.py` and speaks stdio:
 
 ```shell
 uv run python -m app.mcp_server
@@ -279,6 +281,62 @@ Relative paths resolve against the working directory. Start the web application
 separately: the MCP process opens the same file directly and never runs its own
 processing engine, so processing still has one owner.
 
+### Hermes configuration
+
+Hermes reads MCP servers from `~/.hermes/config.yaml`. Keep the token in
+`~/.hermes/.env` and reference it with `${NAME}`, so the secret never sits in
+the YAML:
+
+```yaml
+# ~/.hermes/config.yaml
+mcp_servers:
+  hookwatch:
+    command: "uv"
+    args: ["run", "python", "-m", "app.mcp_server"]
+    cwd: "C:/path/to/Hookwatch"
+    env:
+      HOOKWATCH_DB_PATH: "C:/path/to/Hookwatch/hookwatch.db"
+      HOOKWATCH_REPLAY_TOKEN: "${HOOKWATCH_REPLAY_TOKEN}"
+      HOOKWATCH_MCP_OPERATOR: "hermes"
+    trust: untrusted
+    tools:
+      include:
+        - list_events
+        - get_event
+        - search_failed_events
+        - inspect_processing_history
+        - replay_event
+```
+
+```shell
+# ~/.hermes/.env
+HOOKWATCH_REPLAY_TOKEN=replace-with-a-long-random-value
+```
+
+`trust: untrusted` makes Hermes ask before any tool that is not marked
+read-only. The four inspection tools carry `readOnlyHint: true`, so they run
+without a prompt. `replay_event` carries `readOnlyHint: false` and
+`destructiveHint: true`, so Hermes prompts before every call. Removing
+`replay_event` from `tools.include`, or unsetting the token, removes replay
+entirely.
+
+Restart Hermes after changing the configuration. Tool names are prefixed by the
+server name, so they appear as `hookwatch_list_events` and so on.
+
+### Example workflow
+
+With the configuration above, a typical session looks like this:
+
+1. "List the failed webhook events."
+   The agent calls `list_events` or `search_failed_events`.
+2. "Why did event 12 fail?"
+   The agent calls `get_event` or `inspect_processing_history` and reads the
+   attempts, failure kinds and stored errors.
+3. "The timeout is fixed. Replay event 12."
+   The agent calls `replay_event`, and Hermes asks for approval first. After
+   the call the event is `received`, the web process's engine picks it up, and
+   a later `get_event` shows the new attempt.
+
 ### Tools
 
 | Tool | Arguments | Returns |
@@ -287,6 +345,7 @@ processing engine, so processing still has one owner.
 | `get_event` | `record_id` | One event with payload, attempts and replay audit trail. |
 | `search_failed_events` | `source`, `event_type`, `dead_lettered`, `limit`, `offset` | Failed events only, newest first. |
 | `inspect_processing_history` | `record_id` | Attempts and replays without the payload. |
+| `replay_event` | `record_id`, `reason` (3-500 characters) | Queues a failed or processed event for another cycle. Only registered when the process holds a replay token. |
 
 Filters are exact matches and combine with AND, exactly like `GET /events`.
 `dead_lettered: true` means the engine has given up on the event;
@@ -299,6 +358,49 @@ form get the same data. The response models are shared with the HTTP API, with
 them for both interfaces. Every tool calls `EventService`; no SQL or business
 rule is duplicated in the MCP module.
 
+### Replay over MCP
+
+Replay is the only mutating tool. It follows the same rules as the HTTP
+endpoint:
+
+- Only `failed` or `processed` events can be replayed. A `received` event is
+  already queued and a `processing` event is in flight; both are refused.
+- The event returns to `received` and keeps its id, so the database still holds
+  one row per `(source, event_id)`. The web process's engine picks it up on its
+  next pass.
+- The call does not process anything. The MCP process still never starts the
+  engine.
+- Every replay writes an audit row containing the reason and
+  `HOOKWATCH_MCP_OPERATOR` (default `mcp-agent`). That value names the
+  configured process, not a verified person.
+
+The token is held by the MCP server process and is never a tool argument, never
+returned and never logged. When it is unset, `replay_event` is not registered at
+all, so it does not appear in tool discovery and the model cannot call it. The
+agent therefore cannot see the secret, supply it or work around it.
+
+### Human approval and its limits
+
+Two independent gates protect replay:
+
+| Gate | Enforced by | What it proves |
+| --- | --- | --- |
+| Replay token | HookWatch | This process is allowed to replay. |
+| Approval prompt | The MCP client, for example Hermes | A human chose this call. |
+
+The second gate is client-side. Approvals can be turned off with YOLO mode or
+`approvals.mode: off`, and HookWatch receives the same tool call either way. It
+cannot tell whether a human clicked approve, because that decision never travels
+with the request. The token still prevents an unconfigured process from
+replaying, and the status rules still limit what can be replayed, but
+server-enforced approval needs a separate design and belongs with the
+authorization work in Stage 10.
+
+This matters because `get_event` returns the payload, and payload text is
+written by the sender, not by HookWatch. A malicious webhook could contain
+instructions aimed at the agent. Keeping approval on is what stands between
+untrusted payload text and a repeated side effect.
+
 ### Resource
 
 `hookwatch://events/{record_id}` returns the same detail view as `get_event` as
@@ -307,15 +409,12 @@ prefer reading a URI.
 
 ### Behaviour
 
-- The server applies pending migrations when it starts. After that it only
-  reads: no tool inserts, updates or deletes rows.
+- The server applies pending migrations when it starts. Apart from the explicit
+  `replay_event` call, no tool inserts, updates or deletes rows.
 - An unknown id is a tool error with the message `event N does not exist`.
   Invalid arguments are rejected by the input schema before the service runs.
   Unexpected failures are logged and reported without exposing SQL or a stack
   trace.
-- Replay is deliberately not exposed over MCP. It is a mutating operator action
-  that needs an authorization contract, which belongs to the AI agent
-  integration stage.
 - The transport is stdio only. The server is meant to be launched by a local
   client, not exposed on a network socket.
 
@@ -668,6 +767,9 @@ directly.
 The MCP tests use the SDK's in-memory client against a temporary seeded
 database. They cover tool discovery, structured results, filtering, paging,
 unknown ids, invalid arguments, the processing history view and resource reads.
+Replay tests cover the closed default, explicit disabling, tool annotations,
+operator attribution, refused states and the guarantee that the token never
+appears in discovery or tool output.
 
 ## Event data contract
 
@@ -720,7 +822,7 @@ Behaviour worth knowing:
 |   |-- engine.py         Background processing loop
 |   |-- lifecycle.py      Event statuses, allowed transitions and failure kinds
 |   |-- main.py           App factory, routers, engine startup and logging
-|   |-- mcp_server.py     Read-only MCP server over stdio
+|   |-- mcp_server.py     MCP server over stdio, read-only unless replay is enabled
 |   |-- repositories/
 |   |   |-- __init__.py
 |   |   `-- events.py     EventRepository, the only place with event SQL
@@ -746,7 +848,7 @@ Behaviour worth knowing:
 |   |-- test_engine.py         Background loop and FastAPI integration tests
 |   |-- test_monitoring.py     Listing, filtering and detail endpoint tests
 |   |-- test_replay.py         Replay service, authorization and API tests
-|   |-- test_mcp_server.py     MCP tool discovery, results and resource tests
+|   |-- test_mcp_server.py     MCP tools, replay gating, approval hints and resource tests
 |   |-- test_persistence.py    API to database tests and restart behaviour
 |   `-- test_inspect_events.py Inspector tool tests
 |-- tools/
@@ -768,18 +870,21 @@ both interfaces return.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `HOOKWATCH_DB_PATH` | `hookwatch.db` | SQLite database file. Read once at startup by each process. |
-| `HOOKWATCH_REPLAY_TOKEN` | unset | Bearer token required by `POST /events/{id}/replay`. Unset disables replay. |
+| `HOOKWATCH_REPLAY_TOKEN` | unset | Enables replay. Required by `POST /events/{id}/replay` and by the MCP `replay_event` tool. Unset disables replay in both interfaces. |
+| `HOOKWATCH_MCP_OPERATOR` | `mcp-agent` | Name recorded as `requested_by` in the replay audit trail for MCP calls. |
 
 Both the web application and the MCP server read `HOOKWATCH_DB_PATH`; they must
 use the same path for the MCP tools to see the events the API stored. The MCP
-server does not use the replay token because it cannot replay.
+server also reads `HOOKWATCH_REPLAY_TOKEN` to decide whether to register
+`replay_event`, and `HOOKWATCH_MCP_OPERATOR` to name itself in the audit trail.
 
 Processing intervals, attempt limits and backoff values are code defaults in
 `ProcessingSettings`. They are not environment variables yet, because deployment
 configuration belongs to the production hardening stage.
 
 The replay token is a secret. It is read from the environment at startup and is
-never written to the database or the logs. There is no user authentication yet.
+never written to the database, the logs or an MCP tool argument. There is no
+user authentication yet.
 
 ## Not implemented yet
 
@@ -791,6 +896,7 @@ exist:
 - Payload size limits at the HTTP layer
 - Retention, archival or cleanup of stored events
 - Operational metrics or dashboards
-- Replay or any other mutating tool over MCP
+- Other mutating tools over MCP beyond controlled replay
 - MCP transports other than stdio, MCP authentication and resource subscriptions
-- MCP client configuration and agent workflows (Stage 9)
+- Approval enforced by HookWatch itself; approval currently depends on the MCP
+  client honouring the tool annotations
