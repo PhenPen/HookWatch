@@ -3,13 +3,16 @@ from pathlib import Path
 import pytest
 
 from app.services.events import ProcessingSettings
-from app.settings import Settings
+from app.settings import Settings, parse_webhook_secrets
 
 VARIABLES = (
     "HOOKWATCH_DB_PATH",
     "HOOKWATCH_REPLAY_TOKEN",
     "HOOKWATCH_ENGINE_ENABLED",
     "HOOKWATCH_LOG_LEVEL",
+    "HOOKWATCH_WEBHOOK_SECRETS",
+    "HOOKWATCH_REQUIRE_SIGNATURES",
+    "HOOKWATCH_SIGNATURE_TOLERANCE_SECONDS",
     "HOOKWATCH_POLL_INTERVAL_SECONDS",
     "HOOKWATCH_BATCH_SIZE",
     "HOOKWATCH_MAX_ATTEMPTS",
@@ -33,7 +36,17 @@ def test_defaults_match_the_code_defaults() -> None:
     assert settings.replay_token is None
     assert settings.engine_enabled is True
     assert settings.log_level == "INFO"
+    assert settings.webhook_secrets == {}
+    assert settings.require_signatures is True
+    assert settings.signature_tolerance_seconds == 300
     assert settings.processing == ProcessingSettings()
+
+
+def test_enforcement_is_on_by_default_and_needs_a_secret() -> None:
+    settings = Settings.from_env()
+
+    with pytest.raises(ValueError, match="at least one webhook secret"):
+        settings.validate_for_startup()
 
 
 def test_reads_every_variable(
@@ -43,6 +56,11 @@ def test_reads_every_variable(
     monkeypatch.setenv("HOOKWATCH_REPLAY_TOKEN", "a-secret")
     monkeypatch.setenv("HOOKWATCH_ENGINE_ENABLED", "false")
     monkeypatch.setenv("HOOKWATCH_LOG_LEVEL", "debug")
+    monkeypatch.setenv(
+        "HOOKWATCH_WEBHOOK_SECRETS", "github=one,stripe=two"
+    )
+    monkeypatch.setenv("HOOKWATCH_REQUIRE_SIGNATURES", "true")
+    monkeypatch.setenv("HOOKWATCH_SIGNATURE_TOLERANCE_SECONDS", "120")
     monkeypatch.setenv("HOOKWATCH_POLL_INTERVAL_SECONDS", "0.5")
     monkeypatch.setenv("HOOKWATCH_BATCH_SIZE", "3")
     monkeypatch.setenv("HOOKWATCH_MAX_ATTEMPTS", "7")
@@ -56,6 +74,9 @@ def test_reads_every_variable(
     assert settings.replay_token == "a-secret"
     assert settings.engine_enabled is False
     assert settings.log_level == "DEBUG"
+    assert settings.webhook_secrets == {"github": "one", "stripe": "two"}
+    assert settings.require_signatures is True
+    assert settings.signature_tolerance_seconds == 120
     assert settings.processing.poll_interval_seconds == 0.5
     assert settings.processing.batch_size == 3
     assert settings.processing.max_attempts == 7
@@ -78,6 +99,24 @@ def test_accepts_false_spellings(monkeypatch: pytest.MonkeyPatch, raw: str) -> N
     assert Settings.from_env().engine_enabled is False
 
 
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "on"])
+def test_accepts_true_signature_spellings(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv("HOOKWATCH_REQUIRE_SIGNATURES", raw)
+
+    assert Settings.from_env().require_signatures is True
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "FALSE", "no", "off"])
+def test_accepts_false_signature_spellings(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv("HOOKWATCH_REQUIRE_SIGNATURES", raw)
+
+    assert Settings.from_env().require_signatures is False
+
+
 def test_blank_variables_fall_back_to_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -90,6 +129,9 @@ def test_blank_variables_fall_back_to_defaults(
     assert settings.replay_token is None
     assert settings.engine_enabled is True
     assert settings.log_level == "INFO"
+    assert settings.webhook_secrets == {}
+    assert settings.require_signatures is True
+    assert settings.signature_tolerance_seconds == 300
     assert settings.processing == ProcessingSettings()
 
 
@@ -102,6 +144,15 @@ def test_blank_variables_fall_back_to_defaults(
         ("HOOKWATCH_POLL_INTERVAL_SECONDS", "nan", "must be finite"),
         ("HOOKWATCH_BACKOFF_CAP_SECONDS", "inf", "must be finite"),
         ("HOOKWATCH_ENGINE_ENABLED", "maybe", "must be one of"),
+        ("HOOKWATCH_REQUIRE_SIGNATURES", "maybe", "must be one of"),
+        (
+            "HOOKWATCH_SIGNATURE_TOLERANCE_SECONDS",
+            "soon",
+            "must be an integer",
+        ),
+        ("HOOKWATCH_WEBHOOK_SECRETS", "github", "source=secret"),
+        ("HOOKWATCH_WEBHOOK_SECRETS", "github=a,github=b", "more than once"),
+        ("HOOKWATCH_WEBHOOK_SECRETS", "bad name=one", "source"),
     ],
 )
 def test_unparsable_values_name_the_variable(
@@ -155,3 +206,86 @@ def test_repr_does_not_expose_the_replay_token() -> None:
 
     assert "super-secret" not in repr(settings)
     assert "super-secret" not in str(settings)
+
+
+def test_repr_does_not_expose_webhook_secrets() -> None:
+    settings = Settings(webhook_secrets={"github": "signing-secret"})
+
+    assert "signing-secret" not in repr(settings)
+    assert "signing-secret" not in str(settings)
+
+
+def test_webhook_secrets_mapping_is_copied() -> None:
+    configured = {"github": "one"}
+    settings = Settings(webhook_secrets=configured)
+
+    configured["github"] = "changed"
+
+    assert settings.webhook_secrets == {"github": "one"}
+
+
+def test_webhook_secrets_are_parsed() -> None:
+    assert parse_webhook_secrets("") == {}
+    assert parse_webhook_secrets("   ") == {}
+    assert parse_webhook_secrets(" github = one , stripe = two ") == {
+        "github": "one",
+        "stripe": "two",
+    }
+    # Only the first equals sign separates the pair, so a secret may contain
+    # one. This keeps base64-style secrets usable.
+    assert parse_webhook_secrets("github=a=b") == {"github": "a=b"}
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        ("github", "source=secret"),
+        ("github=", "source=secret"),
+        ("=one", "source=secret"),
+        ("github=one,", "empty entry"),
+        (",github=one", "empty entry"),
+        ("github=one,stripe", "source=secret"),
+        ("github=one,github=two", "more than once"),
+        ("bad name=one", "source"),
+        ("a" * 65 + "=one", "source"),
+        ("github=one,stripe=", "source=secret"),
+    ],
+)
+def test_webhook_secrets_reject_bad_entries(raw: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        parse_webhook_secrets(raw)
+
+
+def test_explicit_webhook_secrets_are_validated() -> None:
+    with pytest.raises(ValueError, match="source"):
+        Settings(webhook_secrets={"bad name": "one"}, require_signatures=False)
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        Settings(webhook_secrets={"github": "   "}, require_signatures=False)
+
+
+@pytest.mark.parametrize("tolerance", [0, -1, 86401])
+def test_impossible_tolerances_are_rejected(tolerance: int) -> None:
+    with pytest.raises(ValueError, match="signature_tolerance_seconds"):
+        Settings(
+            signature_tolerance_seconds=tolerance,
+            require_signatures=False,
+        )
+
+
+@pytest.mark.parametrize("tolerance", [1, 300, 86400])
+def test_acceptable_tolerances_are_kept(tolerance: int) -> None:
+    settings = Settings(
+        signature_tolerance_seconds=tolerance,
+        require_signatures=False,
+    )
+
+    assert settings.signature_tolerance_seconds == tolerance
+
+
+def test_enforcement_passes_with_a_secret() -> None:
+    Settings(webhook_secrets={"github": "one"}).validate_for_startup()
+
+
+def test_enforcement_can_be_disabled_without_secrets() -> None:
+    Settings(require_signatures=False).validate_for_startup()

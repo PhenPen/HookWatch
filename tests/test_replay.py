@@ -242,6 +242,7 @@ def replay_app(database_path: Path):
         Settings(
             database_path=database_path,
             engine_enabled=False,
+            require_signatures=False,
             replay_token="replay-secret",
         )
     )
@@ -280,6 +281,7 @@ def test_replay_requires_a_configured_token(database_path: Path) -> None:
         Settings(
             database_path=database_path,
             engine_enabled=False,
+            require_signatures=False,
             replay_token="",
         )
     )

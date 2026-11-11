@@ -3,14 +3,20 @@
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.api.deps import get_event_service
+from app.api.signatures import (
+    SIGNATURE_HEADER,
+    SignatureError,
+    verify_signature,
+)
 from app.schemas.event import WebhookEvent
 from app.services.events import EventService
+from app.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +36,81 @@ SourceName = Annotated[
 ]
 
 
-@router.post("/webhooks/{source}", status_code=status.HTTP_202_ACCEPTED)
+def _rejected_signature() -> HTTPException:
+    """Answer every signature failure the same way.
+
+    A caller learns that the delivery was refused, not whether the source is
+    configured, whether the timestamp was stale or whether the digest was
+    wrong. The log keeps the specific reason for the operator.
+    """
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="invalid or missing webhook signature",
+    )
+
+
+async def require_signed_delivery(
+    source: SourceName,
+    request: Request,
+) -> None:
+    """Refuse a delivery that cannot be proven to come from its source.
+
+    FastAPI may have read the body before this dependency runs, but Starlette
+    caches the raw bytes, so ``await request.body()`` returns exactly what was
+    sent. That matters: the signature covers raw bytes, never re-serialised
+    JSON.
+
+    With enforcement on, an unconfigured source is refused as well. The source
+    name comes from an attacker-controlled path, so accepting an unlisted one
+    would let a sender bypass signatures entirely by picking a new name.
+    """
+    config: Settings = request.app.state.config
+    header = request.headers.get(SIGNATURE_HEADER)
+    secret = config.webhook_secrets.get(source)
+
+    if secret is None:
+        if header is not None or config.require_signatures:
+            logger.warning(
+                "webhook signature rejected source=%s reason=no_secret",
+                source,
+            )
+            raise _rejected_signature()
+        return
+
+    if header is None:
+        if not config.require_signatures:
+            logger.warning(
+                "webhook accepted unsigned source=%s enforcement=off",
+                source,
+            )
+            return
+        logger.warning(
+            "webhook signature rejected source=%s reason=missing",
+            source,
+        )
+        raise _rejected_signature()
+
+    try:
+        verify_signature(
+            secret,
+            await request.body(),
+            header,
+            tolerance_seconds=config.signature_tolerance_seconds,
+        )
+    except SignatureError as error:
+        logger.warning(
+            "webhook signature rejected source=%s reason=%s",
+            source,
+            error.reason,
+        )
+        raise _rejected_signature() from error
+
+
+@router.post(
+    "/webhooks/{source}",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_signed_delivery)],
+)
 def receive_webhook(
     source: SourceName,
     event: WebhookEvent,

@@ -29,8 +29,10 @@ detail and processing history over stdio, and can also queue an event for
 replay when its process holds the replay token. Replay is annotated as
 destructive, so clients such as Hermes require approval before running it.
 Stages are implemented one at a time, and each stage is committed separately.
-Stage 10 (production hardening) is in progress: the web process now loads and
-validates its configuration from the environment before it starts.
+Stage 10 (production hardening) is in progress: the web process loads and
+validates its configuration from the environment before it starts, and webhook
+deliveries are authenticated per source with HMAC-SHA256 signatures. A process
+that requires signatures without configuring a secret refuses to start.
 
 | Stage | Scope | Status |
 | --- | --- | --- |
@@ -44,7 +46,7 @@ validates its configuration from the environment before it starts.
 | 7 | Monitoring and event replay | Complete |
 | 8 | MCP server | Complete |
 | 9 | AI agent integration | Complete |
-| 10 | Production hardening | In progress (configuration) |
+| 10 | Production hardening | In progress (configuration, sender signatures) |
 
 ## Requirements
 
@@ -81,6 +83,9 @@ below for its location, contents and how to inspect it.
 `POST /webhooks/{source}` accepts one event. The `{source}` segment names the
 sending service and lives in the URL, not the body, so an event from GitHub is
 posted to `/webhooks/github`.
+
+With signature enforcement disabled (it is on by default, see
+[Signatures](#signatures)):
 
 ```shell
 curl -i -X POST http://127.0.0.1:8000/webhooks/github \
@@ -120,6 +125,7 @@ and underscore.
 | --- | --- |
 | `202` | The event is new, valid, stored and queued for processing. |
 | `200` | The event was already stored. Nothing new was written. |
+| `401` | The signature is missing, malformed, stale or does not match the source secret. Nothing was stored. |
 | `404` | No route matched, for example `POST /webhooks` with no source segment. |
 | `405` | The method is not allowed, for example `GET /webhooks/github`. |
 | `422` | The body or the source segment failed validation. The response body lists every offending field. |
@@ -132,9 +138,78 @@ INFO:app.api.webhooks:webhook duplicate source=github event_id=evt_1 row=1
 WARNING:app.api.webhooks:request rejected path=/webhooks/github fields=[('body', 'event_id')]
 ```
 
-Incoming deliveries are not authenticated and carry no signature. Anything that
-matches the schema is accepted, which is a known gap until the security work.
-Replay is the exception: it is guarded by a shared token, described below.
+### Signatures
+
+Sender authenticity is verified with an HMAC-SHA256 signature. It is required by
+default. A delivery to a source with no configured secret is refused, because
+the source name comes from the URL: accepting an unlisted one would let anyone
+bypass the check by inventing a new name.
+
+The sender and HookWatch share one secret per source. The sender computes:
+
+```text
+X-HookWatch-Signature: t=<unix seconds>,v1=<hex digest>
+v1 = HMAC-SHA256(secret, f"{t}.".encode() + raw_body)
+```
+
+The timestamp is part of the signed message, so it cannot be moved without the
+secret. HookWatch refuses a timestamp further than
+`HOOKWATCH_SIGNATURE_TOLERANCE_SECONDS` (default 300) from its own clock, in
+either direction. The digest covers the raw request bytes, not re-serialised
+JSON: key order and whitespace are part of what the sender signed, and rewriting
+the body would invalidate a correct signature.
+
+Configure one secret per source:
+
+```shell
+HOOKWATCH_WEBHOOK_SECRETS="github=replace-with-a-long-random-value,stripe=another-value"
+```
+
+Pairs are comma separated and split at the first `=`, so a secret may contain an
+equals sign. Generated secrets are URL-safe. The settings object hides the map
+from its `repr`, so logging the configuration does not print the secrets.
+
+The simulator signs automatically when the map is set, or with `--secret`:
+
+```shell
+uv run python -m tools.simulate_webhook --secret replace-with-a-long-random-value
+```
+
+To sign a manual request, compute the header over the exact bytes you send:
+
+```python
+import hashlib
+import hmac
+import time
+
+body = b'{"event_id":"evt_1","event_type":"invoice.paid","occurred_at":"2026-11-07T12:00:00Z","data":{"amount":500}}'
+timestamp = int(time.time())
+digest = hmac.new(
+    b"replace-with-a-long-random-value",
+    f"{timestamp}.".encode() + body,
+    hashlib.sha256,
+).hexdigest()
+print(f"t={timestamp},v1={digest}")
+```
+
+Then send those bytes with `--data-binary` and
+`-H "X-HookWatch-Signature: t=...,v1=..."`.
+
+A missing, malformed, stale, future or mismatching signature is answered with
+`401` and nothing is stored. Every failure returns the same response, so a caller
+cannot probe which sources exist or why the check failed; the log keeps the
+specific reason.
+
+Signatures prove the body came from someone holding the shared secret and was
+not altered in transit. They do not encrypt the payload, do not identify a human
+operator, and do not replace TLS. They also do not validate the event's own
+`occurred_at`; the signed timestamp describes the delivery, not the business
+event.
+
+If `HOOKWATCH_REQUIRE_SIGNATURES=true` and no secret is configured, the process
+refuses to start. Set it to `false` for local work without signatures; a
+signature that is supplied is still verified in that mode, and a signed request
+for a source with no secret is still refused.
 
 ## Inspecting events
 
@@ -741,6 +816,11 @@ so a new event returns `202` and the tool exits `0`. A redelivery returns `200`
 with status `duplicate`, which is still a 2xx response and also exits `0`. Use
 `--raw` to send a broken payload and watch the receiver reject it with `422`.
 
+Signing is automatic when the source has a secret in
+`HOOKWATCH_WEBHOOK_SECRETS`; `--secret` overrides the lookup. Without either, the
+tool sends unsigned requests, which only works against a server running with
+enforcement disabled.
+
 Sending the same `--event-id` more than once delivers the same event repeatedly.
 That exercises idempotency: the first delivery is stored and answered with
 `202`, every later one is answered with `200` and no second row is written.
@@ -762,14 +842,22 @@ default.
 uv run pytest
 ```
 
-The API test fixtures build an explicit `Settings` with
-`engine_enabled=False`, so no test depends on the environment and assertions
-about the initial `received` state are deterministic. Engine tests enable it
-explicitly or drive the service directly.
+The API test fixtures build an explicit `Settings` with `engine_enabled=False`
+and `require_signatures=False`, so no test depends on the environment and
+assertions about the initial `received` state are deterministic. Engine tests
+enable processing explicitly; the signature suite enables enforcement and signs
+every delivery.
 
 `tests/test_settings.py` covers environment parsing, boolean spellings, blank
-values falling back to defaults, rejected values, and the rule that the replay
-token never appears in the settings repr.
+values falling back to defaults, rejected values, webhook secret parsing and
+validation, tolerance bounds, and the rule that neither the replay token nor the
+webhook secrets appear in the settings repr.
+
+`tests/test_signatures.py` covers valid deliveries, wrong secrets, tampered
+bodies, stale and future timestamps, malformed headers, unconfigured sources,
+enforcement switched off, and the startup refusal when enforcement has no
+secret. `tests/test_simulator.py` proves the simulator signs the exact bytes it
+sends and picks up the configured per-source secret.
 
 The MCP tests use the SDK's in-memory client against a temporary seeded
 database. They cover tool discovery, structured results, filtering, paging,
@@ -807,9 +895,10 @@ Behaviour worth knowing:
 - Fields generated by HookWatch itself, such as the event source, the moment it
   was received, processing status and attempt counts, are not part of this
   contract. The sender does not supply them.
-- Timestamp freshness is not enforced. Rejecting events dated far in the past
-  or future only becomes meaningful once signatures are verified, so it is
-  deferred to the security work and recorded here rather than implemented.
+- The event's own `occurred_at` is not checked for freshness. Signature
+  verification now rejects stale deliveries, but that timestamp describes the
+  delivery rather than the business event, and an event may legitimately arrive
+  late. Enforcing `occurred_at` freshness would be a separate policy.
 - No payload size limit is applied at this layer. That belongs to the HTTP
   receiver.
 
@@ -824,6 +913,7 @@ Behaviour worth knowing:
 |   |   |-- deps.py       Shared route dependencies
 |   |   |-- events.py     Inspection, filtering and replay endpoints
 |   |   |-- replay_auth.py Replay bearer token check
+|   |   |-- signatures.py   HMAC parsing and verification for deliveries
 |   |   `-- webhooks.py   Webhook receiver endpoint and error logging
 |   |-- db.py             Connections, migrations and row models
 |   |-- engine.py         Background processing loop
@@ -857,6 +947,7 @@ Behaviour worth knowing:
 |   |-- test_monitoring.py     Listing, filtering and detail endpoint tests
 |   |-- test_replay.py         Replay service, authorization and API tests
 |   |-- test_settings.py       Configuration parsing and validation tests
+|   |-- test_signatures.py     Signature parsing, verification and enforcement tests
 |   |-- test_mcp_server.py     MCP tools, replay gating, approval hints and resource tests
 |   |-- test_persistence.py    API to database tests and restart behaviour
 |   `-- test_inspect_events.py Inspector tool tests
@@ -887,6 +978,9 @@ the problem, rather than silently falling back to a default.
 | `HOOKWATCH_REPLAY_TOKEN` | unset | both processes | Enables replay. Required by `POST /events/{id}/replay` and by the MCP `replay_event` tool. Unset or blank disables replay. |
 | `HOOKWATCH_ENGINE_ENABLED` | `true` | web | Start the in-process processing engine. |
 | `HOOKWATCH_LOG_LEVEL` | `INFO` | web | Root log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. |
+| `HOOKWATCH_WEBHOOK_SECRETS` | empty | web | `source=secret` pairs used to verify sender signatures. Required while enforcement is on. |
+| `HOOKWATCH_REQUIRE_SIGNATURES` | `true` | web | Require a valid signature for every delivery. True with no secrets stops startup. |
+| `HOOKWATCH_SIGNATURE_TOLERANCE_SECONDS` | `300` | web | Accepted difference between the signed timestamp and the server clock, 1 to 86400. |
 | `HOOKWATCH_POLL_INTERVAL_SECONDS` | `1.0` | web | Wait before the next pass when nothing was due. |
 | `HOOKWATCH_BATCH_SIZE` | `10` | web | Maximum events examined per pass. |
 | `HOOKWATCH_MAX_ATTEMPTS` | `5` | web | Attempts per replay cycle before an event is dead-lettered. |
@@ -898,7 +992,14 @@ the problem, rather than silently falling back to a default.
 Booleans accept `true`, `false`, `1`, `0`, `yes`, `no`, `on` and `off`,
 case-insensitive. Blank values fall back to the default. Numeric values must be
 finite; `nan` and `inf` are rejected, as are zero or negative intervals, a zero
-batch size, zero attempts, and a backoff cap below the base.
+batch size, zero attempts, a backoff cap below the base, and a signature
+tolerance outside 1 to 86400 seconds.
+
+`HOOKWATCH_WEBHOOK_SECRETS` is a comma-separated list of `source=secret` pairs.
+Each pair is split at the first `=`, so a secret may contain one. Source names
+use the same 1 to 64 character rule as the URL segment. Duplicate sources,
+empty pairs and empty secrets are rejected. A comma cannot appear in a secret
+because comma separates the pairs; generated secrets do not need one.
 
 Both processes read `HOOKWATCH_DB_PATH`; they must use the same path for the MCP
 tools to see the events the API stored. The MCP server also reads
@@ -918,19 +1019,23 @@ redundant. Choose one shape:
 Configuration is read once at startup. Changing an environment variable requires
 a restart; there is no config file and no reload at runtime.
 
-The replay token is a secret. It is read from the environment at startup and is
-never written to the database, the logs or an MCP tool argument. The settings
-object also hides it from its `repr`, so logging the settings does not print it.
-There is no user authentication yet.
+The replay token and the webhook secrets are secrets. They are read from the
+environment at startup and are never written to the database, the logs or an MCP
+tool argument. The settings object hides both from its `repr`, so logging the
+settings does not print them. Sender signatures authenticate a service, not a
+person; operator authentication is separate work and is not implemented yet.
 
 ## Not implemented yet
 
 These are planned but deliberately absent, so nothing here should be assumed to
 exist:
 
-- Signature verification, ingestion authentication, rate limiting or per-user
-  authorization
+- Per-user authentication and authorization; replay still uses one shared token
+- Rate limiting at the HTTP layer
 - Payload size limits at the HTTP layer
+- Per-source adapters for third-party signature formats such as
+  `Stripe-Signature` or `X-Hub-Signature-256`; HookWatch currently defines its
+  own header
 - Retention, archival or cleanup of stored events
 - Operational metrics or dashboards
 - Other mutating tools over MCP beyond controlled replay

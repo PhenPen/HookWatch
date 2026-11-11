@@ -6,7 +6,19 @@ import httpx2
 import pytest
 from pydantic import ValidationError
 
-from tools.simulate_webhook import SendResult, build_event, main, post_json
+from app.api.signatures import (
+    SIGNATURE_HEADER,
+    parse_signature_header,
+    sign,
+)
+from tools.simulate_webhook import (
+    SendResult,
+    build_event,
+    main,
+    post_json,
+    resolve_secret,
+    source_from_url,
+)
 
 
 def test_build_event_satisfies_the_contract() -> None:
@@ -208,3 +220,66 @@ def test_raw_payload_bypasses_contract_validation(
 
     assert json.loads(requests[0].content) == {"event_id": "", "event_type": "x"}
     assert "422" in capsys.readouterr().out
+
+
+def test_source_from_url_uses_the_last_path_segment() -> None:
+    assert source_from_url("http://hookwatch.test/webhooks/github") == "github"
+    assert source_from_url("http://hookwatch.test/webhooks/github/") == "github"
+
+
+def test_post_json_signs_the_exact_bytes_it_sends() -> None:
+    client, requests = make_client(202, '{"status": "accepted"}')
+
+    with client:
+        post_json(client, "http://hookwatch.test/webhooks/demo", {"a": 1}, "secret")
+
+    sent = requests[0]
+    parts = parse_signature_header(sent.headers[SIGNATURE_HEADER])
+    assert parts.digest == sign("secret", sent.content, parts.timestamp)
+
+
+def test_post_json_stays_unsigned_without_a_secret() -> None:
+    client, requests = make_client(202, "{}")
+
+    with client:
+        post_json(client, "http://hookwatch.test/webhooks/demo", {"a": 1})
+
+    assert SIGNATURE_HEADER not in requests[0].headers
+
+
+def test_resolve_secret_prefers_the_explicit_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOOKWATCH_WEBHOOK_SECRETS", "github=from-env")
+
+    assert resolve_secret("http://x/webhooks/github", "explicit") == "explicit"
+
+
+def test_resolve_secret_reads_the_configured_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "HOOKWATCH_WEBHOOK_SECRETS",
+        "github=from-env,stripe=other",
+    )
+
+    assert resolve_secret("http://x/webhooks/stripe", None) == "other"
+    assert resolve_secret("http://x/webhooks/unknown", None) is None
+
+
+def test_resolve_secret_returns_none_without_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HOOKWATCH_WEBHOOK_SECRETS", raising=False)
+
+    assert resolve_secret("http://x/webhooks/github", None) is None
+
+
+def test_resolve_secret_warns_about_a_malformed_map(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOOKWATCH_WEBHOOK_SECRETS", "github")
+
+    assert resolve_secret("http://x/webhooks/github", None) is None
+    assert "warning:" in capsys.readouterr().err

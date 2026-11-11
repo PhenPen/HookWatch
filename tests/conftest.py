@@ -17,8 +17,17 @@ def database_path(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def settings(database_path: Path) -> Settings:
-    """Explicit configuration, so tests never depend on the environment."""
-    return Settings(database_path=database_path, engine_enabled=False)
+    """Explicit configuration, so tests never depend on the environment.
+
+    Signature enforcement is disabled here because most tests are about the
+    event lifecycle, not about sender authentication. The signature suite turns
+    it on explicitly and signs every delivery.
+    """
+    return Settings(
+        database_path=database_path,
+        engine_enabled=False,
+        require_signatures=False,
+    )
 
 
 @pytest.fixture

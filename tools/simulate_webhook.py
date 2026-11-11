@@ -13,6 +13,13 @@ Examples:
     uv run python -m tools.simulate_webhook --data '{"amount": 500}'
     uv run python -m tools.simulate_webhook --event-id evt_fixed --count 2
     uv run python -m tools.simulate_webhook --raw '{"event_id": ""}'
+    uv run python -m tools.simulate_webhook --secret dev-secret
+
+When the target requires signatures, the delivery is signed automatically. The
+secret is taken from --secret, or looked up for the URL's source in
+HOOKWATCH_WEBHOOK_SECRETS, which is the same map the web process reads. With
+neither configured the simulator sends unsigned deliveries, which is useful
+against a server running with enforcement disabled.
 
 Sending the same event id twice is how duplicate deliveries will be simulated
 once duplicate detection exists.
@@ -28,16 +35,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Sequence
+from urllib.parse import urlparse
 
 import httpx2
 from pydantic import ValidationError
 
+from app.api.signatures import SIGNATURE_HEADER, signature_header
 from app.schemas.event import WebhookEvent
+from app.settings import parse_webhook_secrets
 
 DEFAULT_URL = "http://127.0.0.1:8000/webhooks/simulator"
 DEFAULT_EVENT_TYPE = "simulator.ping"
@@ -74,13 +85,61 @@ def build_event(
     )
 
 
-def post_json(client: httpx2.Client, url: str, payload: Any) -> SendResult:
+def encode_payload(payload: Any) -> bytes:
+    """Serialise once, because the signature covers the exact bytes sent."""
+    return json.dumps(
+        payload,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def source_from_url(url: str) -> str:
+    """Return the last path segment, which is the source the server records."""
+    return urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+
+
+def resolve_secret(url: str, explicit: str | None) -> str | None:
+    """Pick the signing secret for the URL's source, or None to send unsigned.
+
+    Reading the same HOOKWATCH_WEBHOOK_SECRETS map the server uses avoids a
+    second place to keep the same secret in sync. A malformed map is reported
+    and treated as unsigned; the server will reject the delivery, which makes
+    the problem visible without hiding the request.
+    """
+    if explicit:
+        return explicit
+
+    raw = os.environ.get("HOOKWATCH_WEBHOOK_SECRETS", "")
+    if not raw.strip():
+        return None
+
+    try:
+        secrets = parse_webhook_secrets(raw)
+    except ValueError as error:
+        print(f"warning: {error}; sending unsigned deliveries", file=sys.stderr)
+        return None
+
+    return secrets.get(source_from_url(url))
+
+
+def post_json(
+    client: httpx2.Client,
+    url: str,
+    payload: Any,
+    secret: str | None = None,
+) -> SendResult:
     """Post one JSON payload and return the response instead of raising.
 
     Error responses are data here: the simulator exists to inspect them, so a
     400 or 500 is reported rather than turned into an exception.
     """
-    response = client.post(url, json=payload)
+    body = encode_payload(payload)
+    headers = {"Content-Type": "application/json"}
+    if secret is not None:
+        headers[SIGNATURE_HEADER] = signature_header(secret, body)
+
+    response = client.post(url, content=body, headers=headers)
     return SendResult(status_code=response.status_code, body=response.text)
 
 
@@ -127,6 +186,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=5.0,
         help="request timeout in seconds (default: 5)",
     )
+    parser.add_argument(
+        "--secret",
+        default=None,
+        help=(
+            "signing secret for the source in --url "
+            "(default: look it up in HOOKWATCH_WEBHOOK_SECRETS)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -172,17 +239,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SystemExit as exit_request:
         return int(exit_request.code or 0)
 
+    secret = resolve_secret(args.url, args.secret)
+
     print(f"POST {args.url}")
     if args.raw is not None:
         print(f"  raw payload, sent without validation, count={args.count}")
     else:
         print(f"  event_type={args.event_type} count={args.count}")
+    if secret is None:
+        print("  unsigned; set HOOKWATCH_WEBHOOK_SECRETS or --secret to sign")
+    else:
+        print(f"  signed for source={source_from_url(args.url)}")
 
     exit_code = 0
     with httpx2.Client(timeout=args.timeout) as client:
         for index, payload in enumerate(payloads, start=1):
             try:
-                result = post_json(client, args.url, payload)
+                result = post_json(client, args.url, payload, secret)
             except httpx2.HTTPError as error:
                 print(
                     f"  [{index}/{len(payloads)}] request failed: {error}",

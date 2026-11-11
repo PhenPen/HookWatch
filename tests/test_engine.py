@@ -88,6 +88,7 @@ def test_engine_processes_events_inside_fastapi(database_path: Path) -> None:
     settings = Settings(
         database_path=database_path,
         engine_enabled=True,
+        require_signatures=False,
         processing=ProcessingSettings(poll_interval_seconds=0.01),
     )
     app = create_app(settings)
@@ -110,7 +111,13 @@ def test_engine_processes_events_inside_fastapi(database_path: Path) -> None:
 
 
 def test_engine_can_be_disabled(database_path: Path) -> None:
-    app = create_app(Settings(database_path=database_path, engine_enabled=False))
+    app = create_app(
+        Settings(
+            database_path=database_path,
+            engine_enabled=False,
+            require_signatures=False,
+        )
+    )
 
     with TestClient(app) as client:
         response = client.post("/webhooks/github", json=VALID_EVENT)

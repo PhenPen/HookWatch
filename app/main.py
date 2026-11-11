@@ -32,6 +32,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     never depend on the environment. Without one, Settings.from_env() reads and
     validates the HOOKWATCH_* variables, so a bad value stops startup instead
     of failing later inside a request or the engine.
+
+    Cross-field rules that depend on how the process will run, such as
+    signature enforcement without any secret, are checked in the lifespan.
+    That keeps importing this module free of configuration failures while still
+    refusing to serve a process that cannot enforce what it claims.
     """
     config = settings or Settings.from_env()
 
@@ -42,6 +47,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        config.validate_for_startup()
+
         applied = migrate(config.database_path)
         if applied:
             logger.info(
@@ -54,7 +61,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service = EventService(repository, settings=config.processing)
         app.state.events = repository
         app.state.event_service = service
-        app.state.settings = config.processing
+        app.state.config = config
+        app.state.processing = config.processing
         app.state.replay_token = config.replay_token
 
         stop = asyncio.Event()
