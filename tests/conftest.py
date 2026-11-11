@@ -5,8 +5,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.db import Role
 from app.main import create_app
 from app.settings import Settings
+
+OPERATOR_NAME = "test-operator"
 
 
 @pytest.fixture
@@ -37,5 +40,14 @@ def app(settings: Settings) -> FastAPI:
 
 @pytest.fixture
 def client(app: FastAPI) -> Iterator[TestClient]:
+    """A client that is authenticated as an operator by default.
+
+    The key is created after the lifespan has run, because that is what
+    migrates the database. Most tests are about behaviour rather than
+    authorization, so they inherit this header; tests that prove a refusal
+    replace or remove it.
+    """
     with TestClient(app) as test_client:
+        issued = app.state.keys.create(OPERATOR_NAME, Role.OPERATOR)
+        test_client.headers["Authorization"] = f"Bearer {issued.key}"
         yield test_client

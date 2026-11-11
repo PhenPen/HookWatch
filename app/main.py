@@ -19,7 +19,9 @@ from app.api.webhooks import router as webhooks_router
 from app.db import migrate
 from app.engine import run_forever
 from app.repositories.events import EventRepository
+from app.repositories.keys import KeyRepository
 from app.services.events import EventService
+from app.services.keys import KeyService
 from app.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -59,11 +61,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         repository = EventRepository(config.database_path)
         service = EventService(repository, settings=config.processing)
+        keys = KeyService(KeyRepository(config.database_path))
         app.state.events = repository
         app.state.event_service = service
+        app.state.keys = keys
         app.state.config = config
         app.state.processing = config.processing
-        app.state.replay_token = config.replay_token
 
         stop = asyncio.Event()
         engine_task: asyncio.Task[None] | None = None

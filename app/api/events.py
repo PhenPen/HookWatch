@@ -7,10 +7,11 @@ interface so the MCP server reuses the same rules.
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from app.api.auth import require_operator, require_viewer
 from app.api.deps import get_event_service
-from app.api.replay_auth import require_replay_token
+from app.db import Principal
 from app.lifecycle import EventStatus, ReplayNotAllowedError
 from app.schemas.inspection import (
     EventDetail,
@@ -21,7 +22,14 @@ from app.schemas.inspection import (
 from app.services.events import EventService
 from app.views import event_detail, event_summary
 
-router = APIRouter(prefix="/events", tags=["events"])
+# Reading a stored payload is not harmless: it can contain anything the sender
+# sent. Every route here therefore requires an authenticated caller, and replay
+# tightens that to the operator role on the route itself.
+router = APIRouter(
+    prefix="/events",
+    tags=["events"],
+    dependencies=[Depends(require_viewer)],
+)
 
 # Filters are exact matches. Free-text search is deliberately absent: the
 # payload belongs to the sender and may be large, so scanning it is a different
@@ -47,14 +55,6 @@ DeadLetterFilter = Annotated[
 ]
 Limit = Annotated[int, Query(ge=1, le=200, description="Maximum rows to return.")]
 Offset = Annotated[int, Query(ge=0, description="Rows to skip for paging.")]
-Operator = Annotated[
-    str | None,
-    Header(
-        alias="X-Operator",
-        max_length=100,
-        description="Optional operator name recorded in the replay audit trail.",
-    ),
-]
 
 
 @router.get("", response_model=list[EventSummary])
@@ -108,13 +108,12 @@ def get_event(
     "/{record_id}/replay",
     response_model=ReplayResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(require_replay_token)],
 )
 def replay_event(
     record_id: int,
     request: ReplayRequest,
     service: Annotated[EventService, Depends(get_event_service)],
-    operator: Operator = None,
+    principal: Annotated[Principal, Depends(require_operator)],
 ) -> ReplayResponse:
     """Queue an existing event for another processing cycle.
 
@@ -124,14 +123,15 @@ def replay_event(
 
     Only failed and processed events are replayable. A received event is
     already queued, and a processing event is in flight; both answer 409.
-    """
-    requested_by = (operator or "").strip() or "unspecified"
 
+    The audit trail records the name attached to the caller's key. That name is
+    verified, unlike a header, and a request cannot choose a different one.
+    """
     try:
         replay = service.replay_event(
             record_id,
             reason=request.reason,
-            requested_by=requested_by,
+            requested_by=principal.name,
         )
     except LookupError as error:
         raise HTTPException(

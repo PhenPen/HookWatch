@@ -78,15 +78,20 @@ def test_fresh_database_gets_every_migration(database_path: Path) -> None:
 
     assert applied == len(MIGRATIONS)
     assert read_version(database_path) == schema_version()
-    assert {"events", "attempts", "replays"} <= read_tables(database_path)
+    assert {"events", "attempts", "replays", "principals"} <= read_tables(database_path)
     assert {"status", "dead_lettered_at", "replay_count"} <= read_columns(
         database_path, "events"
     )
     assert {"failure_kind", "replay_number"} <= read_columns(
         database_path, "attempts"
     )
+    assert {"name", "role", "key_prefix", "key_hash"} <= read_columns(
+        database_path, "principals"
+    )
     assert "events_source_event_id" in read_indexes(database_path)
     assert "events_status_idx" in read_indexes(database_path)
+    assert "principals_active_name" in read_indexes(database_path)
+    assert "principals_key_hash" in read_indexes(database_path)
 
 
 def test_migrating_twice_changes_nothing(database_path: Path) -> None:
@@ -140,7 +145,7 @@ def test_version_four_database_gets_replay_support(database_path: Path) -> None:
 
     applied = migrate(database_path)
 
-    assert applied == 1
+    assert applied == 2  # versions 5 and 6
     assert read_version(database_path) == schema_version()
     assert "replays" in read_tables(database_path)
     assert "replay_count" in read_columns(database_path, "events")
@@ -150,6 +155,26 @@ def test_version_four_database_gets_replay_support(database_path: Path) -> None:
             "SELECT source, event_id, replay_count FROM events"
         ).fetchone()
     assert row == ("github", "evt_1", 0)
+
+
+def test_version_five_database_gets_operator_identities(database_path: Path) -> None:
+    build_version(database_path, 5)
+    insert_event(database_path, "github", "evt_1")
+
+    applied = migrate(database_path)
+
+    assert applied == 1
+    assert read_version(database_path) == schema_version()
+    assert "principals" in read_tables(database_path)
+    assert {"name", "role", "key_prefix", "key_hash"} <= read_columns(
+        database_path, "principals"
+    )
+    assert "principals_active_name" in read_indexes(database_path)
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT source, event_id FROM events"
+        ).fetchone()
+    assert row == ("github", "evt_1")
 
 
 def test_upgrade_deduplicates_existing_rows(database_path: Path) -> None:

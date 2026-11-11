@@ -7,7 +7,6 @@ from app.settings import Settings, parse_webhook_secrets
 
 VARIABLES = (
     "HOOKWATCH_DB_PATH",
-    "HOOKWATCH_REPLAY_TOKEN",
     "HOOKWATCH_ENGINE_ENABLED",
     "HOOKWATCH_LOG_LEVEL",
     "HOOKWATCH_WEBHOOK_SECRETS",
@@ -33,7 +32,6 @@ def test_defaults_match_the_code_defaults() -> None:
     settings = Settings.from_env()
 
     assert settings.database_path == Path("hookwatch.db")
-    assert settings.replay_token is None
     assert settings.engine_enabled is True
     assert settings.log_level == "INFO"
     assert settings.webhook_secrets == {}
@@ -53,7 +51,6 @@ def test_reads_every_variable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("HOOKWATCH_DB_PATH", str(tmp_path / "events.db"))
-    monkeypatch.setenv("HOOKWATCH_REPLAY_TOKEN", "a-secret")
     monkeypatch.setenv("HOOKWATCH_ENGINE_ENABLED", "false")
     monkeypatch.setenv("HOOKWATCH_LOG_LEVEL", "debug")
     monkeypatch.setenv(
@@ -71,7 +68,6 @@ def test_reads_every_variable(
     settings = Settings.from_env()
 
     assert settings.database_path == tmp_path / "events.db"
-    assert settings.replay_token == "a-secret"
     assert settings.engine_enabled is False
     assert settings.log_level == "DEBUG"
     assert settings.webhook_secrets == {"github": "one", "stripe": "two"}
@@ -126,7 +122,6 @@ def test_blank_variables_fall_back_to_defaults(
     settings = Settings.from_env()
 
     assert settings.database_path == Path("hookwatch.db")
-    assert settings.replay_token is None
     assert settings.engine_enabled is True
     assert settings.log_level == "INFO"
     assert settings.webhook_secrets == {}
@@ -195,17 +190,6 @@ def test_log_level_is_normalised() -> None:
 def test_unknown_log_level_is_rejected() -> None:
     with pytest.raises(ValueError, match="log_level"):
         Settings(log_level="verbose")
-
-
-def test_blank_replay_token_disables_replay() -> None:
-    assert Settings(replay_token="   ").replay_token is None
-
-
-def test_repr_does_not_expose_the_replay_token() -> None:
-    settings = Settings(replay_token="super-secret")
-
-    assert "super-secret" not in repr(settings)
-    assert "super-secret" not in str(settings)
 
 
 def test_repr_does_not_expose_webhook_secrets() -> None:

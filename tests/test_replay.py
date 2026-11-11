@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from app.db import migrate
+from app.db import Role, migrate
 from app.lifecycle import (
     AttemptOutcome,
     EventStatus,
@@ -18,7 +18,7 @@ from app.services.events import EventService, ProcessingSettings
 from app.settings import Settings
 
 NOW = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
-AUTH = {"Authorization": "Bearer replay-secret"}
+OPERATOR_NAME = "test-operator"
 
 
 def make_event(event_id: str = "evt_1") -> WebhookEvent:
@@ -243,7 +243,6 @@ def replay_app(database_path: Path):
             database_path=database_path,
             engine_enabled=False,
             require_signatures=False,
-            replay_token="replay-secret",
         )
     )
 
@@ -251,6 +250,8 @@ def replay_app(database_path: Path):
 @pytest.fixture
 def replay_client(replay_app):
     with TestClient(replay_app) as client:
+        issued = replay_app.state.keys.create(OPERATOR_NAME, Role.OPERATOR)
+        client.headers["Authorization"] = f"Bearer {issued.key}"
         yield client
 
 
@@ -276,52 +277,6 @@ def mark_processed(client: TestClient, record_id: int) -> None:
     service.finish_processing(attempt_id, succeeded=True)
 
 
-def test_replay_requires_a_configured_token(database_path: Path) -> None:
-    app = create_app(
-        Settings(
-            database_path=database_path,
-            engine_enabled=False,
-            require_signatures=False,
-            replay_token="",
-        )
-    )
-
-    with TestClient(app) as client:
-        record_id = post_event(client)
-        response = client.post(
-            f"/events/{record_id}/replay",
-            json={"reason": "try again"},
-            headers=AUTH,
-        )
-
-    assert response.status_code == 403
-    assert "disabled" in response.json()["detail"]
-
-
-def test_replay_rejects_a_missing_token(replay_client: TestClient) -> None:
-    record_id = post_event(replay_client)
-
-    response = replay_client.post(
-        f"/events/{record_id}/replay",
-        json={"reason": "try again"},
-    )
-
-    assert response.status_code == 401
-    assert response.headers["www-authenticate"] == "Bearer"
-
-
-def test_replay_rejects_a_wrong_token(replay_client: TestClient) -> None:
-    record_id = post_event(replay_client)
-
-    response = replay_client.post(
-        f"/events/{record_id}/replay",
-        json={"reason": "try again"},
-        headers={"Authorization": "Bearer wrong"},
-    )
-
-    assert response.status_code == 401
-
-
 def test_replay_queues_a_processed_event(replay_client: TestClient) -> None:
     record_id = post_event(replay_client)
     mark_processed(replay_client, record_id)
@@ -329,7 +284,6 @@ def test_replay_queues_a_processed_event(replay_client: TestClient) -> None:
     response = replay_client.post(
         f"/events/{record_id}/replay",
         json={"reason": "re-run after a configuration change"},
-        headers={**AUTH, "X-Operator": "alice"},
     )
 
     assert response.status_code == 202
@@ -344,22 +298,24 @@ def test_replay_queues_a_processed_event(replay_client: TestClient) -> None:
     assert detail["replay_count"] == 1
     assert len(detail["replays"]) == 1
     assert detail["replays"][0]["replay_number"] == 1
-    assert detail["replays"][0]["requested_by"] == "alice"
+    assert detail["replays"][0]["requested_by"] == OPERATOR_NAME
     assert detail["replays"][0]["reason"] == "re-run after a configuration change"
 
 
-def test_replay_records_an_unspecified_operator(replay_client: TestClient) -> None:
+def test_replay_records_the_key_name_and_ignores_a_claimed_operator(
+    replay_client: TestClient,
+) -> None:
     record_id = post_event(replay_client)
     mark_processed(replay_client, record_id)
 
     replay_client.post(
         f"/events/{record_id}/replay",
-        json={"reason": "no operator header"},
-        headers=AUTH,
+        json={"reason": "header must not choose the identity"},
+        headers={"X-Operator": "alice"},
     )
 
     detail = replay_client.get(f"/events/{record_id}").json()
-    assert detail["replays"][0]["requested_by"] == "unspecified"
+    assert detail["replays"][0]["requested_by"] == OPERATOR_NAME
 
 
 def test_replay_refuses_an_event_that_is_still_queued(
@@ -370,7 +326,6 @@ def test_replay_refuses_an_event_that_is_still_queued(
     response = replay_client.post(
         f"/events/{record_id}/replay",
         json={"reason": "too early"},
-        headers=AUTH,
     )
 
     assert response.status_code == 409
@@ -386,7 +341,6 @@ def test_replay_refuses_an_event_that_is_processing(
     response = replay_client.post(
         f"/events/{record_id}/replay",
         json={"reason": "too early"},
-        headers=AUTH,
     )
 
     assert response.status_code == 409
@@ -401,12 +355,10 @@ def test_replay_cannot_be_issued_twice_while_queued(
     first = replay_client.post(
         f"/events/{record_id}/replay",
         json={"reason": "first replay"},
-        headers=AUTH,
     )
     second = replay_client.post(
         f"/events/{record_id}/replay",
         json={"reason": "second replay"},
-        headers=AUTH,
     )
 
     assert first.status_code == 202
@@ -420,7 +372,6 @@ def test_replay_rejects_a_missing_reason(replay_client: TestClient) -> None:
     response = replay_client.post(
         f"/events/{record_id}/replay",
         json={"reason": "no"},
-        headers=AUTH,
     )
 
     assert response.status_code == 422
@@ -430,7 +381,6 @@ def test_replay_returns_404_for_an_unknown_event(replay_client: TestClient) -> N
     response = replay_client.post(
         "/events/999/replay",
         json={"reason": "nothing there"},
-        headers=AUTH,
     )
 
     assert response.status_code == 404
@@ -442,7 +392,6 @@ def test_replay_keeps_the_single_event_row(replay_client: TestClient) -> None:
     replay_client.post(
         f"/events/{record_id}/replay",
         json={"reason": "replay once"},
-        headers=AUTH,
     )
 
     duplicate = replay_client.post(
@@ -467,7 +416,6 @@ def test_replay_rejects_unknown_body_fields(replay_client: TestClient) -> None:
     response = replay_client.post(
         f"/events/{record_id}/replay",
         json={"reason": "valid reason", "extra": True},
-        headers=AUTH,
     )
 
     assert response.status_code == 422

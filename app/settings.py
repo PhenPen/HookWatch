@@ -127,13 +127,13 @@ class Settings:
     One object instead of scattered arguments and environment reads. Tests build
     it explicitly, so no test depends on the developer's environment.
 
-    The replay token and the webhook secrets use repr=False because this is a
-    frozen dataclass and its generated repr would otherwise print the secrets
-    whenever someone logs the settings.
+    The webhook secrets use repr=False because this is a frozen dataclass and
+    its generated repr would otherwise print the secrets whenever someone logs
+    the settings. Operator API keys are not configuration at all: they live in
+    the database and are read by KeyService.
     """
 
     database_path: Path = DEFAULT_DATABASE_PATH
-    replay_token: str | None = field(default=None, repr=False)
     engine_enabled: bool = True
     log_level: str = DEFAULT_LOG_LEVEL
     webhook_secrets: dict[str, str] = field(default_factory=dict, repr=False)
@@ -152,11 +152,6 @@ class Settings:
                 + f", got {self.log_level!r}"
             )
         object.__setattr__(self, "log_level", log_level)
-
-        # An empty or whitespace-only token means replay is disabled, not that
-        # a blank secret is configured.
-        if self.replay_token is not None and not self.replay_token.strip():
-            object.__setattr__(self, "replay_token", None)
 
         # Copy the mapping so a caller cannot mutate configuration afterwards.
         secrets: dict[str, str] = {}
@@ -240,7 +235,6 @@ class Settings:
         try:
             return cls(
                 database_path=Path(raw_path) if raw_path else DEFAULT_DATABASE_PATH,
-                replay_token=os.environ.get("HOOKWATCH_REPLAY_TOKEN"),
                 engine_enabled=_boolean("HOOKWATCH_ENGINE_ENABLED", True),
                 log_level=log_level,
                 webhook_secrets=parse_webhook_secrets(

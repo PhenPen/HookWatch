@@ -5,6 +5,7 @@ import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -93,7 +94,49 @@ MIGRATIONS: list[list[str]] = [
         )
         """,
     ],
+    # Version 6: operator identities. A key is stored as a SHA-256 hash, never
+    # in clear, so a copy of the database cannot be used to call the API. The
+    # short prefix is kept only so an operator can tell keys apart. The partial
+    # unique index enforces one active key per name while allowing a rotation
+    # to revoke the old row and insert its replacement under the same name.
+    [
+        """
+        CREATE TABLE IF NOT EXISTS principals (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            name         TEXT NOT NULL,
+            role         TEXT NOT NULL CHECK (role IN ('viewer', 'operator')),
+            key_prefix   TEXT NOT NULL,
+            key_hash     TEXT NOT NULL,
+            created_at   TEXT NOT NULL,
+            last_used_at TEXT,
+            revoked_at   TEXT
+        )
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS principals_active_name
+            ON principals (name) WHERE revoked_at IS NULL
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS principals_key_hash ON principals (key_hash)",
+    ],
 ]
+
+
+class Role(StrEnum):
+    """What an authenticated principal may do.
+
+    Operator includes every viewer permission plus replay. The hierarchy lives
+    with the role rather than in each interface, so HTTP and MCP cannot drift.
+    """
+
+    VIEWER = "viewer"
+    OPERATOR = "operator"
+
+    def covers(self, required: "Role") -> bool:
+        """Whether this role is allowed to do what another role allows."""
+        return _ROLE_RANK[self] >= _ROLE_RANK[required]
+
+
+_ROLE_RANK = {Role.VIEWER: 1, Role.OPERATOR: 2}
 
 
 @dataclass(frozen=True)
@@ -195,6 +238,44 @@ class Replay:
             requested_at=datetime.fromisoformat(row["requested_at"]),
             requested_by=row["requested_by"],
             reason=row["reason"],
+        )
+
+
+@dataclass(frozen=True)
+class Principal:
+    """One caller identity, stored as a hashed API key.
+
+    The raw key is never part of this model: it exists in the response to
+    creation or rotation and nowhere else. The prefix is a display aid, not a
+    credential.
+    """
+
+    id: int
+    name: str
+    role: Role
+    key_prefix: str
+    created_at: datetime
+    last_used_at: datetime | None
+    revoked_at: datetime | None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Principal":
+        return cls(
+            id=row["id"],
+            name=row["name"],
+            role=Role(row["role"]),
+            key_prefix=row["key_prefix"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            last_used_at=(
+                datetime.fromisoformat(row["last_used_at"])
+                if row["last_used_at"] is not None
+                else None
+            ),
+            revoked_at=(
+                datetime.fromisoformat(row["revoked_at"])
+                if row["revoked_at"] is not None
+                else None
+            ),
         )
 
 

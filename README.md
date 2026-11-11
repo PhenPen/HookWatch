@@ -5,8 +5,8 @@ Webhook monitoring and management system with an MCP interface.
 HookWatch receives webhook events, validates them, stores them and tracks their
 processing lifecycle so that failed deliveries can be investigated and
 recovered. The same application services are exposed to AI agents through an
-MCP server that stays read-only unless a replay token is configured, without
-duplicating business logic between the HTTP API and the MCP layer.
+MCP server that stays read-only unless an operator API key is configured,
+without duplicating business logic between the HTTP API and the MCP layer.
 
 The authoritative specification and staged roadmap are kept in a local
 `hookwatch_implementation.md` document. It is intentionally not tracked in Git,
@@ -14,7 +14,7 @@ so it will not appear in a fresh clone of this repository.
 
 ## Status
 
-Stage 9 (AI agent integration) is complete. The application starts, serves a
+Stages 0 through 9 are complete. The application starts, serves a
 health check, validates webhook event envelopes, accepts them at
 `POST /webhooks/{source}` and stores them in SQLite before responding, so events
 survive a restart. A
@@ -24,15 +24,17 @@ stored events, retries temporary failures with exponential backoff, classifies
 permanent failures and dead-letters events that will not be retried. Events,
 attempts and replay history can be inspected over HTTP with filters, and failed
 or processed events can be queued for another processing cycle by an operator
-holding the replay token. A separate MCP server exposes the same listings,
-detail and processing history over stdio, and can also queue an event for
-replay when its process holds the replay token. Replay is annotated as
-destructive, so clients such as Hermes require approval before running it.
+holding an API key with the operator role. A separate MCP server exposes the
+same listings, detail and processing history over stdio, and can also queue an
+event for replay when its process holds a valid operator key. Replay is
+annotated as destructive, so clients such as Hermes require approval before
+running it.
 Stages are implemented one at a time, and each stage is committed separately.
 Stage 10 (production hardening) is in progress: the web process loads and
-validates its configuration from the environment before it starts, and webhook
-deliveries are authenticated per source with HMAC-SHA256 signatures. A process
-that requires signatures without configuring a secret refuses to start.
+validates its configuration from the environment before it starts, webhook
+deliveries are authenticated per source with HMAC-SHA256 signatures, and humans
+and agents authenticate with database-backed API keys that carry a role. A
+process that requires signatures without configuring a secret refuses to start.
 
 | Stage | Scope | Status |
 | --- | --- | --- |
@@ -46,7 +48,7 @@ that requires signatures without configuring a secret refuses to start.
 | 7 | Monitoring and event replay | Complete |
 | 8 | MCP server | Complete |
 | 9 | AI agent integration | Complete |
-| 10 | Production hardening | In progress (configuration, sender signatures) |
+| 10 | Production hardening | In progress (configuration, sender signatures, API keys) |
 
 ## Requirements
 
@@ -225,9 +227,14 @@ combine with AND:
 | `limit` | Rows to return, 1 to 200. Default 50. |
 | `offset` | Rows to skip. Default 0. |
 
+Both routes require an API key. A `viewer` key is sufficient; an operator key
+works too. See [Operator API keys](#operator-api-keys).
+
 ```shell
-curl "http://127.0.0.1:8000/events?status=failed&dead_lettered=true"
-curl "http://127.0.0.1:8000/events?source=github&limit=20&offset=20"
+curl -H "Authorization: Bearer $HOOKWATCH_API_KEY" \
+  "http://127.0.0.1:8000/events?status=failed&dead_lettered=true"
+curl -H "Authorization: Bearer $HOOKWATCH_API_KEY" \
+  "http://127.0.0.1:8000/events?source=github&limit=20&offset=20"
 ```
 
 The listing omits `data`; payloads belong to the detail view and can be large.
@@ -236,7 +243,8 @@ The listing omits `data`; payloads belong to the detail view and can be large.
 replay history:
 
 ```shell
-curl http://127.0.0.1:8000/events/1
+curl -H "Authorization: Bearer $HOOKWATCH_API_KEY" \
+  http://127.0.0.1:8000/events/1
 ```
 
 ```json
@@ -270,6 +278,81 @@ Attempts are what makes a failure investigable: each row shows which try ran,
 whether it succeeded, whether the failure was retryable or permanent, and the
 stored error. An unknown id returns `404`; an invalid filter returns `422`.
 
+## Operator API keys
+
+Reading events and replaying them require an API key. Keys live in the database
+rather than in configuration, so they can be issued, rotated and revoked without
+restarting the server, and so a copy of the environment or a log never contains
+every operator's credential.
+
+Two roles exist:
+
+| Role | Can read | Can replay |
+| --- | --- | --- |
+| `viewer` | yes | no |
+| `operator` | yes | yes |
+
+An operator is a superset of a viewer. Reads are protected because a payload can
+contain anything the sender sent. Replay is restricted more tightly because it
+repeats a side effect.
+
+Each key is 256 random bits, shown once as `hw_...`. Only its SHA-256 hash and a
+short display prefix are stored, so the raw key cannot be recovered from the
+database, a backup or a listing. SHA-256 is used instead of a password hash
+because the key is generated randomness, not a human-chosen password: there is
+nothing to brute force, and the lookup must stay cheap on every request.
+
+Manage keys with the CLI against the same database the server uses:
+
+```shell
+uv run python -m tools.manage_keys create --name hermes --role operator
+uv run python -m tools.manage_keys create --name dashboard --role viewer
+uv run python -m tools.manage_keys list
+uv run python -m tools.manage_keys list --all
+uv run python -m tools.manage_keys rotate --name hermes
+uv run python -m tools.manage_keys revoke --name dashboard
+```
+
+The database must exist first; start HookWatch once on a new checkout. The
+command applies pending migrations, so it also works against a database created
+by an earlier stage. `create` and `rotate` print the new key as JSON on stdout
+and the "shown once" warning on stderr. `list` never prints a secret: only the
+name, role, prefix and timestamps.
+
+Rotation revokes the old row and inserts its replacement under the same name in
+one transaction, so the audit trail still shows one identity. Revocation takes
+effect on the next HTTP request. The MCP process re-checks its key on every
+replay call, so it does not need a restart either.
+
+Send the key as a bearer token:
+
+```shell
+curl -H "Authorization: Bearer hw_..." http://127.0.0.1:8000/events
+```
+
+`401` means the key is missing, malformed, unknown or revoked. `403` means the
+key is valid but its role is insufficient. Keeping the two apart tells a viewer
+what to ask for while telling an anonymous caller nothing about which keys
+exist.
+
+Webhook senders do not use API keys. They authenticate per source with HMAC
+signatures, described in [Signatures](#signatures). A key identifies an
+operator; a signature proves a delivery came from a service holding its shared
+secret.
+
+### Moving from the replay token
+
+`HOOKWATCH_REPLAY_TOKEN` and `HOOKWATCH_MCP_OPERATOR` no longer exist. To
+migrate, issue one operator key:
+
+```shell
+uv run python -m tools.manage_keys create --name legacy --role operator
+```
+
+Put the printed key in the MCP client's environment as `HOOKWATCH_API_KEY`, use
+it as the HTTP bearer token, and remove the old variables. The key's name, not a
+configured label, is what the replay audit trail records.
+
 ## Replay
 
 `POST /events/{id}/replay` queues an existing event for another processing
@@ -277,13 +360,11 @@ cycle. Replay is an operator action, not a delivery: it never creates a second
 event row, so the unique index on `(source, event_id)` and duplicate detection
 are untouched.
 
-Replay is disabled unless `HOOKWATCH_REPLAY_TOKEN` is set. The caller must send
-it as a bearer token, and a reason is required:
+The caller needs an API key with the `operator` role, and a reason is required:
 
 ```shell
 curl -i -X POST http://127.0.0.1:8000/events/1/replay \
-  -H "Authorization: Bearer $HOOKWATCH_REPLAY_TOKEN" \
-  -H "X-Operator: alice" \
+  -H "Authorization: Bearer $HOOKWATCH_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"reason": "fixed the downstream timeout"}'
 ```
@@ -293,38 +374,37 @@ curl -i -X POST http://127.0.0.1:8000/events/1/replay \
 ```
 
 `202` means queued, not processed. The engine picks the event up like any other
-waiting event. `X-Operator` is optional and recorded in the audit trail; it is
-not verified.
+waiting event. The audit trail records the name attached to the key; a request
+cannot choose a different identity with a header.
 
 | Status | Meaning |
 | --- | --- |
 | `202` | Queued for another cycle. |
-| `401` | Token missing or wrong. |
-| `403` | Replay is disabled because no token is configured. |
+| `401` | API key missing, malformed, unknown or revoked. |
+| `403` | The key is valid but belongs to a viewer, not an operator. |
 | `404` | No event has that id. |
 | `409` | The event is `received` (already queued) or `processing` (in flight). |
 | `422` | The reason is missing, shorter than 3 or longer than 500 characters, or the body has unknown fields. |
 
 Safeguards, and why they exist:
 
-- Replay is closed by default. A missing environment variable disables it
-  instead of exposing it.
+- Replay is closed by default. With no operator key issued, nobody can call it.
 - Only `failed` and `processed` events can be replayed. Queuing an event that is
   already waiting, or replaying one that is mid-flight, is refused.
 - The state check is repeated in the conditional `UPDATE` that performs the
   change, so two operators cannot both replay the same state. The second request
   gets `409`.
 - Every accepted replay is recorded in the `replays` table with its number,
-  timestamp, operator and reason.
+  timestamp, principal name and reason.
 - A replay starts a fresh attempt budget (`replay_count`) without deleting the
   earlier attempts. An event that had exhausted its retries can therefore fail
   again up to `max_attempts` times before being dead-lettered again.
 - Replay calls the same processor as normal processing. Because processing is
   at-least-once, a processor that is unsafe to repeat is also unsafe to replay.
 
-A shared token is not user authentication. It proves the caller knows the
-operator secret, not who they are. Per-user authorization belongs to a later
-stage.
+A key is a bearer credential, not a person. It proves that the caller holds a
+secret that HookWatch issued and has not revoked; it does not prove who typed
+the request. Per-user accounts belong to a later stage.
 
 ## MCP server
 
@@ -357,11 +437,12 @@ A client launches it as a child process. A typical configuration entry:
 `HOOKWATCH_DB_PATH` must point at the database the web application writes to.
 Relative paths resolve against the working directory. Start the web application
 separately: the MCP process opens the same file directly and never runs its own
-processing engine, so processing still has one owner.
+processing engine, so processing still has one owner. Reads need no credential.
+Add `HOOKWATCH_API_KEY` to `env` only when the process should be able to replay.
 
 ### Hermes configuration
 
-Hermes reads MCP servers from `~/.hermes/config.yaml`. Keep the token in
+Hermes reads MCP servers from `~/.hermes/config.yaml`. Keep the key in
 `~/.hermes/.env` and reference it with `${NAME}`, so the secret never sits in
 the YAML:
 
@@ -374,8 +455,7 @@ mcp_servers:
     cwd: "C:/path/to/Hookwatch"
     env:
       HOOKWATCH_DB_PATH: "C:/path/to/Hookwatch/hookwatch.db"
-      HOOKWATCH_REPLAY_TOKEN: "${HOOKWATCH_REPLAY_TOKEN}"
-      HOOKWATCH_MCP_OPERATOR: "hermes"
+      HOOKWATCH_API_KEY: "${HOOKWATCH_API_KEY}"
     trust: untrusted
     tools:
       include:
@@ -388,14 +468,14 @@ mcp_servers:
 
 ```shell
 # ~/.hermes/.env
-HOOKWATCH_REPLAY_TOKEN=replace-with-a-long-random-value
+HOOKWATCH_API_KEY=hw_replace-with-the-key-printed-by-manage_keys
 ```
 
 `trust: untrusted` makes Hermes ask before any tool that is not marked
 read-only. The four inspection tools carry `readOnlyHint: true`, so they run
 without a prompt. `replay_event` carries `readOnlyHint: false` and
 `destructiveHint: true`, so Hermes prompts before every call. Removing
-`replay_event` from `tools.include`, or unsetting the token, removes replay
+`replay_event` from `tools.include`, or unsetting the key, removes replay
 entirely.
 
 Restart Hermes after changing the configuration. Tool names are prefixed by the
@@ -423,7 +503,7 @@ With the configuration above, a typical session looks like this:
 | `get_event` | `record_id` | One event with payload, attempts and replay audit trail. |
 | `search_failed_events` | `source`, `event_type`, `dead_lettered`, `limit`, `offset` | Failed events only, newest first. |
 | `inspect_processing_history` | `record_id` | Attempts and replays without the payload. |
-| `replay_event` | `record_id`, `reason` (3-500 characters) | Queues a failed or processed event for another cycle. Only registered when the process holds a replay token. |
+| `replay_event` | `record_id`, `reason` (3-500 characters) | Queues a failed or processed event for another cycle. Only registered when the process holds a valid operator key. |
 
 Filters are exact matches and combine with AND, exactly like `GET /events`.
 `dead_lettered: true` means the engine has given up on the event;
@@ -448,14 +528,21 @@ endpoint:
   next pass.
 - The call does not process anything. The MCP process still never starts the
   engine.
-- Every replay writes an audit row containing the reason and
-  `HOOKWATCH_MCP_OPERATOR` (default `mcp-agent`). That value names the
-  configured process, not a verified person.
+- Every replay writes an audit row containing the reason and the name attached
+  to the API key. That name is a verified identity, unlike a header, and it is
+  the same name HTTP replays record for that key.
 
-The token is held by the MCP server process and is never a tool argument, never
-returned and never logged. When it is unset, `replay_event` is not registered at
-all, so it does not appear in tool discovery and the model cannot call it. The
-agent therefore cannot see the secret, supply it or work around it.
+The key is held by the MCP server process and is never a tool argument, never
+returned and never logged. When it is unset, unknown, revoked or belongs to a
+viewer, `replay_event` is not registered at all, so it does not appear in tool
+discovery and the model cannot call it. The agent therefore cannot see the
+secret, supply it or work around it. If the key is revoked while the process is
+running, the next call fails instead of replaying.
+
+Reads remain ungated because the trust boundary is the local process and its
+access to the database file: anyone who can launch this server can read the
+database with `sqlite3` anyway. The key protects the repeated side effect, which
+crosses that boundary.
 
 ### Human approval and its limits
 
@@ -463,16 +550,16 @@ Two independent gates protect replay:
 
 | Gate | Enforced by | What it proves |
 | --- | --- | --- |
-| Replay token | HookWatch | This process is allowed to replay. |
+| Operator API key | HookWatch | This process is allowed to replay. |
 | Approval prompt | The MCP client, for example Hermes | A human chose this call. |
 
 The second gate is client-side. Approvals can be turned off with YOLO mode or
 `approvals.mode: off`, and HookWatch receives the same tool call either way. It
 cannot tell whether a human clicked approve, because that decision never travels
-with the request. The token still prevents an unconfigured process from
-replaying, and the status rules still limit what can be replayed, but
-server-enforced approval needs a separate design and belongs with the
-authorization work in Stage 10.
+with the request. The key still prevents an unauthenticated or viewer process
+from replaying, and the status rules still limit what can be replayed, but
+server-enforced approval needs a separate design and is not part of the key
+work.
 
 This matters because `get_event` returns the payload, and payload text is
 written by the sender, not by HookWatch. A malicious webhook could contain
@@ -556,11 +643,31 @@ The `replays` table is the audit trail for operator replay requests:
 | `event_row_id` | integer | The `events.id` that was replayed. |
 | `replay_number` | integer | 1, 2, 3 and so on, matching the event's new `replay_count`. |
 | `requested_at` | text | When the replay was accepted, in UTC. |
-| `requested_by` | text | The `X-Operator` value, or `unspecified`. Not verified. |
+| `requested_by` | text | The `name` of the API key that authorized the replay. Verified. |
 | `reason` | text | The operator's reason, required by the API. |
 
 `(event_row_id, replay_number)` is unique, so a replay request cannot be
 recorded twice for the same cycle.
+
+The `principals` table stores operator identities and hashed API keys:
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `id` | integer | Internal principal key. |
+| `name` | text | Operator-visible identity, unique while active. Recorded as `requested_by`. |
+| `role` | text | `viewer` or `operator`. |
+| `key_prefix` | text | The first characters of the key. A display aid, not a credential. |
+| `key_hash` | text | Hex SHA-256 of the raw key. The raw key is never stored. |
+| `created_at` | text | When this key was issued, in UTC. |
+| `last_used_at` | text | When a request last authenticated with it, or null. |
+| `revoked_at` | text | When it was revoked, or null while active. |
+
+A partial unique index on `name WHERE revoked_at IS NULL` enforces one active
+key per name, while still letting rotation revoke the old row and insert a
+replacement under the same name. Revoked rows are kept because the replays they
+authorized refer to the name, and deleting them would leave that history
+pointing at nothing. A unique index on `key_hash` keeps authentication a single
+deterministic lookup.
 
 Timestamps are stored as ISO 8601 text in UTC. SQLite has no datetime type, and
 text in this fixed format sorts correctly. Offsets are converted to UTC first,
@@ -627,6 +734,7 @@ version instead of half upgraded.
 | 3 | Creates the `attempts` table. |
 | 4 | Adds `attempts.failure_kind`, `events.dead_lettered_at` and an index on `events.status`. |
 | 5 | Adds `events.replay_count`, `attempts.replay_number` and the `replays` audit table. |
+| 6 | Creates the `principals` table plus unique indexes on the active name and the key hash. |
 
 Version 2 deletes all but the oldest row of every duplicate `(source, event_id)`
 pair before creating the unique index, because SQLite refuses to create a unique
@@ -661,9 +769,9 @@ Known limits at this stage:
 - There is one engine task per process. Running several uvicorn workers would
   start one each. Claiming is atomic, so events are not processed twice, but
   there is no leader election or shared scheduling yet.
-- Replay uses one shared bearer token. It proves the caller knows the operator
-  secret, not who they are, and the `X-Operator` value is recorded but not
-  verified.
+- An API key is a bearer credential. Anyone who has it can act as that principal
+  until it is revoked. There is no expiry, scope narrower than the role, session
+  or per-IP restriction.
 - Replay re-runs the same processor. It does not make an unsafe side effect
   safe; at-least-once still applies.
 - Event filtering is exact match on a few columns. There is no full-text search
@@ -850,8 +958,8 @@ every delivery.
 
 `tests/test_settings.py` covers environment parsing, boolean spellings, blank
 values falling back to defaults, rejected values, webhook secret parsing and
-validation, tolerance bounds, and the rule that neither the replay token nor the
-webhook secrets appear in the settings repr.
+validation, tolerance bounds, and the rule that webhook secrets never appear in
+the settings repr.
 
 `tests/test_signatures.py` covers valid deliveries, wrong secrets, tampered
 bodies, stale and future timestamps, malformed headers, unconfigured sources,
@@ -859,12 +967,20 @@ enforcement switched off, and the startup refusal when enforcement has no
 secret. `tests/test_simulator.py` proves the simulator signs the exact bytes it
 sends and picks up the configured per-source secret.
 
+`tests/test_keys.py` covers key issuance, hashing, duplicate names, revocation,
+rotation, last-use tracking, role hierarchy and the guarantee that the raw key
+is not in the database. `tests/test_auth.py` proves the HTTP refusals: missing,
+malformed, unknown and revoked keys get `401`, a viewer can read but not replay,
+and rotation takes effect immediately. `tests/test_manage_keys.py` exercises the
+CLI, including an old database that gains the new table.
+
 The MCP tests use the SDK's in-memory client against a temporary seeded
 database. They cover tool discovery, structured results, filtering, paging,
 unknown ids, invalid arguments, the processing history view and resource reads.
 Replay tests cover the closed default, explicit disabling, tool annotations,
-operator attribution, refused states and the guarantee that the token never
-appears in discovery or tool output.
+principal attribution, refused states, viewer and unknown keys, revocation
+without a restart, and the guarantee that the key never appears in discovery or
+tool output.
 
 ## Event data contract
 
@@ -910,9 +1026,9 @@ Behaviour worth knowing:
 |   |-- __init__.py
 |   |-- api/
 |   |   |-- __init__.py
+|   |   |-- auth.py       Bearer key authentication and role checks
 |   |   |-- deps.py       Shared route dependencies
 |   |   |-- events.py     Inspection, filtering and replay endpoints
-|   |   |-- replay_auth.py Replay bearer token check
 |   |   |-- signatures.py   HMAC parsing and verification for deliveries
 |   |   `-- webhooks.py   Webhook receiver endpoint and error logging
 |   |-- db.py             Connections, migrations and row models
@@ -922,14 +1038,16 @@ Behaviour worth knowing:
 |   |-- mcp_server.py     MCP server over stdio, read-only unless replay is enabled
 |   |-- repositories/
 |   |   |-- __init__.py
-|   |   `-- events.py     EventRepository, the only place with event SQL
+|   |   |-- events.py     EventRepository, the only place with event SQL
+|   |   `-- keys.py       KeyRepository, the only place with principal SQL
 |   |-- schemas/
 |   |   |-- __init__.py
 |   |   |-- event.py      WebhookEvent data contract
 |   |   `-- inspection.py Response models for monitoring, replay and MCP
 |   |-- services/
 |   |   |-- __init__.py
-|   |   `-- events.py     EventService and processing policy
+|   |   |-- events.py     EventService and processing policy
+|   |   `-- keys.py       KeyService: issuance, rotation and authentication
 |   |-- settings.py       Validated environment configuration
 |   `-- views.py          Shared row-to-response mapping for HTTP and MCP
 |-- tests/
@@ -945,15 +1063,19 @@ Behaviour worth knowing:
 |   |-- test_processing.py     Retry, backoff, classification and dead-letter tests
 |   |-- test_engine.py         Background loop and FastAPI integration tests
 |   |-- test_monitoring.py     Listing, filtering and detail endpoint tests
-|   |-- test_replay.py         Replay service, authorization and API tests
+|   |-- test_replay.py         Replay service and API tests
+|   |-- test_auth.py           HTTP authentication and role refusal tests
+|   |-- test_keys.py           Key issuance, rotation, revocation and hashing tests
 |   |-- test_settings.py       Configuration parsing and validation tests
 |   |-- test_signatures.py     Signature parsing, verification and enforcement tests
 |   |-- test_mcp_server.py     MCP tools, replay gating, approval hints and resource tests
 |   |-- test_persistence.py    API to database tests and restart behaviour
-|   `-- test_inspect_events.py Inspector tool tests
+|   |-- test_inspect_events.py Inspector tool tests
+|   `-- test_manage_keys.py    Key management CLI tests
 |-- tools/
 |   |-- simulate_webhook.py    Development tool that sends simulated events
-|   `-- inspect_events.py      Development tool that prints stored events
+|   |-- inspect_events.py      Development tool that prints stored events
+|   `-- manage_keys.py         Development tool that issues and revokes API keys
 |-- pyproject.toml        Project metadata, dependencies, pytest configuration
 |-- uv.lock               Reproducible dependency lock file
 |-- .python-version       Python version selected by uv
@@ -975,7 +1097,7 @@ the problem, rather than silently falling back to a default.
 | Variable | Default | Applies to | Meaning |
 | --- | --- | --- | --- |
 | `HOOKWATCH_DB_PATH` | `hookwatch.db` | both processes | SQLite database file. |
-| `HOOKWATCH_REPLAY_TOKEN` | unset | both processes | Enables replay. Required by `POST /events/{id}/replay` and by the MCP `replay_event` tool. Unset or blank disables replay. |
+| `HOOKWATCH_API_KEY` | unset | MCP | Operator key that enables `replay_event`. Unset, blank, unknown, revoked or viewer keys leave replay unavailable. Never a tool argument. |
 | `HOOKWATCH_ENGINE_ENABLED` | `true` | web | Start the in-process processing engine. |
 | `HOOKWATCH_LOG_LEVEL` | `INFO` | web | Root log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. |
 | `HOOKWATCH_WEBHOOK_SECRETS` | empty | web | `source=secret` pairs used to verify sender signatures. Required while enforcement is on. |
@@ -987,7 +1109,6 @@ the problem, rather than silently falling back to a default.
 | `HOOKWATCH_BACKOFF_BASE_SECONDS` | `2.0` | web | Delay after the first retryable failure. |
 | `HOOKWATCH_BACKOFF_CAP_SECONDS` | `60.0` | web | Maximum backoff delay. Must be at least the base. |
 | `HOOKWATCH_STALE_AFTER_SECONDS` | `300.0` | web | Age at which an open attempt is treated as abandoned. |
-| `HOOKWATCH_MCP_OPERATOR` | `mcp-agent` | MCP | Name recorded as `requested_by` in the replay audit trail. |
 
 Booleans accept `true`, `false`, `1`, `0`, `yes`, `no`, `on` and `off`,
 case-insensitive. Blank values fall back to the default. Numeric values must be
@@ -1003,8 +1124,12 @@ because comma separates the pairs; generated secrets do not need one.
 
 Both processes read `HOOKWATCH_DB_PATH`; they must use the same path for the MCP
 tools to see the events the API stored. The MCP server also reads
-`HOOKWATCH_REPLAY_TOKEN` to decide whether to register `replay_event`, and
-`HOOKWATCH_MCP_OPERATOR` to name itself in the audit trail.
+`HOOKWATCH_API_KEY` to decide whether to register `replay_event`.
+
+Operator API keys are not configuration. They are issued through
+`tools.manage_keys.py` and stored as hashes in the database, so adding,
+rotating or revoking one does not require a restart of the web process and does
+not put the secret in the environment of every process.
 
 ### Running more than one worker
 
@@ -1019,18 +1144,24 @@ redundant. Choose one shape:
 Configuration is read once at startup. Changing an environment variable requires
 a restart; there is no config file and no reload at runtime.
 
-The replay token and the webhook secrets are secrets. They are read from the
+The webhook secrets are configuration secrets. They are read from the
 environment at startup and are never written to the database, the logs or an MCP
-tool argument. The settings object hides both from its `repr`, so logging the
-settings does not print them. Sender signatures authenticate a service, not a
-person; operator authentication is separate work and is not implemented yet.
+tool argument. The settings object hides them from its `repr`, so logging the
+settings does not print them. API keys are a different kind of secret: the raw
+value is shown once by the CLI, only its hash reaches the database, and the MCP
+key is passed through the environment only to the process that needs it. Sender
+signatures authenticate a service, not a person, and an API key identifies an
+operator principal, not a human user account.
 
 ## Not implemented yet
 
 These are planned but deliberately absent, so nothing here should be assumed to
 exist:
 
-- Per-user authentication and authorization; replay still uses one shared token
+- Human user accounts, passwords, OAuth or sessions; API keys identify a
+  principal, not a person
+- Key expiry, per-key scopes and an HTTP admin API for key management; only the
+  CLI manages keys
 - Rate limiting at the HTTP layer
 - Payload size limits at the HTTP layer
 - Per-source adapters for third-party signature formats such as
@@ -1039,7 +1170,9 @@ exist:
 - Retention, archival or cleanup of stored events
 - Operational metrics or dashboards
 - Other mutating tools over MCP beyond controlled replay
-- MCP transports other than stdio, MCP authentication and resource subscriptions
+- MCP transports other than stdio and resource subscriptions; MCP reads are not
+  gated because the process already trusts local filesystem access, and only
+  replay requires a key
 - Approval enforced by HookWatch itself; approval currently depends on the MCP
   client honouring the tool annotations
 - Configuration files (YAML or TOML); only environment variables are supported

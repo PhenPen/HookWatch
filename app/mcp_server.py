@@ -12,10 +12,15 @@ Run it over stdio with:
     uv run python -m app.mcp_server
 
 Four tools are always read-only. `replay_event` is registered only when the
-process holds `HOOKWATCH_REPLAY_TOKEN`; the token is never a tool argument and
-never leaves this process, so a client cannot see, supply or bypass it. The
-tool is annotated as destructive so MCP clients that require approval for
-write-capable tools keep asking the operator.
+process holds a valid operator API key in `HOOKWATCH_API_KEY`; the key is never
+a tool argument and never leaves this process, so a client cannot see, supply or
+bypass it. The tool is annotated as destructive so MCP clients that require
+approval for write-capable tools keep asking the operator.
+
+Reads stay ungated because the trust boundary is the local process and its
+access to the database file: anyone who can launch this server can read the
+database directly with sqlite3. Replay is different, because it asks the web
+process to repeat a side effect, so it needs a key with the operator role.
 """
 
 import logging
@@ -28,9 +33,10 @@ from mcp.server.mcpserver.exceptions import ResourceError, ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field, StringConstraints
 
-from app.db import migrate
+from app.db import Principal, Role, migrate
 from app.lifecycle import EventStatus, ReplayNotAllowedError
 from app.repositories.events import EventRepository
+from app.repositories.keys import KeyRepository
 from app.schemas.inspection import (
     EventDetail,
     EventSummary,
@@ -38,6 +44,7 @@ from app.schemas.inspection import (
     ReplayResponse,
 )
 from app.services.events import EventHistory, EventService
+from app.services.keys import KeyService
 from app.views import event_detail, event_summary, processing_history
 
 DEFAULT_DATABASE_PATH = Path("hookwatch.db")
@@ -104,11 +111,26 @@ def _history(service: EventService, record_id: int) -> EventHistory:
         raise ToolError(str(error)) from error
 
 
+def _operator(keys: KeyService, raw_key: str | None) -> Principal | None:
+    """Return the principal when the key is valid and may replay.
+
+    A viewer key is as unusable as an unknown one here: replay needs the
+    operator role. Returning None rather than distinguishing the cases keeps the
+    MCP surface from advertising something the key cannot do.
+    """
+    if not raw_key or not raw_key.strip():
+        return None
+
+    principal = keys.authenticate(raw_key)
+    if principal is None or not principal.role.covers(Role.OPERATOR):
+        return None
+    return principal
+
+
 def create_mcp_server(
     database_path: Path | None = None,
     *,
-    replay_token: str | None = None,
-    operator: str | None = None,
+    api_key: str | None = None,
 ) -> MCPServer:
     """Build the MCP server against a database file.
 
@@ -117,34 +139,33 @@ def create_mcp_server(
     import time, which keeps the module import side effect free apart from the
     migration that ensures the expected schema exists.
 
-    replay_token is the shared secret that enables replay. None reads
-    HOOKWATCH_REPLAY_TOKEN, and an empty string disables replay explicitly,
-    mirroring create_app so tests can prove the closed default even on a
-    machine where the variable is set. The token is never a tool argument.
+    api_key is the operator key that enables replay. None reads
+    HOOKWATCH_API_KEY, and an empty string disables replay explicitly, mirroring
+    create_app so tests can prove the closed default even on a machine where the
+    variable is set. The key is never a tool argument.
 
-    operator is recorded as requested_by in the replay audit trail. None reads
-    HOOKWATCH_MCP_OPERATOR and falls back to mcp-agent. It names the configured
-    process, not a verified person.
+    The audit trail records the name attached to the key, not a configured
+    label and not a header the client chose.
     """
     path = database_path or Path(
         os.environ.get("HOOKWATCH_DB_PATH", str(DEFAULT_DATABASE_PATH))
     )
-    token = (
-        replay_token
-        if replay_token is not None
-        else os.environ.get("HOOKWATCH_REPLAY_TOKEN")
+    raw_key = (
+        api_key if api_key is not None else os.environ.get("HOOKWATCH_API_KEY")
     )
-    actor = (
-        operator
-        if operator is not None
-        else os.environ.get("HOOKWATCH_MCP_OPERATOR", "mcp-agent")
-    ).strip() or "mcp-agent"
 
     applied = migrate(path)
     if applied:
         logger.info("applied %s database migration(s) to %s", applied, path)
 
     service = EventService(EventRepository(path))
+    keys = KeyService(KeyRepository(path))
+
+    replay_principal = _operator(keys, raw_key)
+    if raw_key and replay_principal is None:
+        logger.warning(
+            "MCP replay disabled: HOOKWATCH_API_KEY is not a valid operator key"
+        )
 
     server = MCPServer(
         name="hookwatch",
@@ -223,7 +244,7 @@ def create_mcp_server(
         """
         return processing_history(_history(service, record_id))
 
-    if token:
+    if replay_principal is not None:
 
         @server.tool(annotations=REPLAY)
         def replay_event(record_id: RecordId, reason: Reason) -> ReplayResponse:
@@ -233,13 +254,23 @@ def create_mcp_server(
             flight, so both are refused. Nothing is processed here: the event
             returns to received and the web process's engine picks it up, just
             like a fresh delivery. Older attempts are kept and the audit trail
-            records this process and the reason.
+            records the key's name and the reason.
+
+            The key is checked again on every call so revoking it takes effect
+            without restarting this process.
             """
+            principal = _operator(keys, raw_key)
+            if principal is None:
+                raise ToolError(
+                    "replay requires a valid operator API key; "
+                    "HOOKWATCH_API_KEY is no longer authorized"
+                )
+
             try:
                 replay = service.replay_event(
                     record_id,
                     reason=reason,
-                    requested_by=actor,
+                    requested_by=principal.name,
                 )
             except (LookupError, ReplayNotAllowedError) as error:
                 raise ToolError(str(error)) from error
