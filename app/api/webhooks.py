@@ -71,6 +71,9 @@ async def require_signed_delivery(
     without a second per-IP tier.
     """
     config: Settings = request.app.state.config
+    # Record the source before the limit, so a refused delivery still names it in
+    # the access log. The value came from the validated path segment.
+    request.state.source = source
     enforce_rate_limit(
         request.app.state.webhook_limits,
         f"source:{source}",

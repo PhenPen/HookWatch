@@ -33,8 +33,9 @@ Stages are implemented one at a time, and each stage is committed separately.
 Stage 10 (production hardening) is in progress: the web process loads and
 validates its configuration from the environment before it starts, webhook
 deliveries are authenticated per source with HMAC-SHA256 signatures, humans
-and agents authenticate with database-backed API keys that carry a role, and
-the HTTP layer caps request bodies and the rate one caller may send. A process
+and agents authenticate with database-backed API keys that carry a role, the
+HTTP layer caps request bodies and the rate one caller may send, and every
+request gets an ID that appears in its access line and handler logs. A process
 that requires signatures without configuring a secret refuses to start.
 
 | Stage | Scope | Status |
@@ -49,7 +50,7 @@ that requires signatures without configuring a secret refuses to start.
 | 7 | Monitoring and event replay | Complete |
 | 8 | MCP server | Complete |
 | 9 | AI agent integration | Complete |
-| 10 | Production hardening | In progress (configuration, sender signatures, API keys, HTTP limits) |
+| 10 | Production hardening | In progress (configuration, sender signatures, API keys, HTTP limits, observability) |
 
 ## Requirements
 
@@ -71,8 +72,11 @@ the same dependency set.
 ## Run
 
 ```shell
-uv run uvicorn app.main:app --reload
+uv run uvicorn app.main:app --reload --no-access-log
 ```
+
+The application writes its own access line per request, so uvicorn's access log
+is disabled to avoid duplicate lines. See Logging below for the format.
 
 - Health check: http://127.0.0.1:8000/health
 - Event monitoring: http://127.0.0.1:8000/events
@@ -259,6 +263,39 @@ bucket, and per-IP limiting belongs with the proxy and deployment work.
 Neither status says whether the caller is authenticated: a delivery can be
 refused before its signature is checked, and a read can be refused after a
 valid key is recognized.
+
+## Logging
+
+Every HTTP request gets an ID. An inbound `X-Request-ID` is accepted when it is
+1 to 64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_` or `-`; anything else is
+replaced with a generated UUID hex. The chosen ID is returned in the
+`X-Request-ID` response header, including on `401`, `413` and `429`, so a sender
+can quote it when reporting a delivery.
+
+Every application log line carries `request_id=<id>`. Outside a request, such as
+the engine loop, the field is `request_id=-`; the engine's event and attempt ids
+are its correlation keys. Handler lines and the access line for one request
+therefore share a value.
+
+One access line is written per request by the `app.access` logger:
+
+```text
+INFO:app.access:request method=POST path=/webhooks/github status=202 duration_ms=4.1 source=github request_id=...
+```
+
+It contains the method, path without the query string, final status, duration,
+request ID, and the verified principal name or webhook source when known. It
+never contains a query string, body, header, API key, signature, replay reason
+or client IP. The principal comes from the key row and the source from the
+validated path, not from a caller-supplied header.
+
+Access lines are `INFO`; `/health` is `DEBUG` so probe traffic does not dominate
+the log. A request that ends before any response was started is logged as
+`status=499`, and an exception that escapes the application is logged as `500`.
+The generated error response for that exception may not carry the header, but
+the log line carries the ID. Uvicorn's own access log would duplicate these
+lines, which is why the run command above disables it. Raising
+`HOOKWATCH_LOG_LEVEL` to `WARNING` silences access lines as well.
 
 ## Inspecting events
 
@@ -1016,6 +1053,13 @@ streamed bodies, exact replay and disconnects, and through the API for `413`,
 `429`, `Retry-After`, per-key and per-source isolation, the `401` before `429`
 order, and the `/health` exemption.
 
+`tests/test_observability.py` covers generated, accepted and rejected request
+IDs, response headers on success and refusal, per-request uniqueness, handler
+lines sharing the access ID, access fields for accepted, `401`, `413`, `422` and
+`429` outcomes, principal and source attribution, the absence of credentials and
+bodies from access lines, concurrent isolation, the `499` and `500` cases, and
+the formatter's `-` outside a request.
+
 `tests/test_signatures.py` covers valid deliveries, wrong secrets, tampered
 bodies, stale and future timestamps, malformed headers, unconfigured sources,
 enforcement switched off, and the startup refusal when enforcement has no
@@ -1092,6 +1136,7 @@ Behaviour worth knowing:
 |   |-- lifecycle.py      Event statuses, allowed transitions and failure kinds
 |   |-- main.py           App factory, routers, engine startup and logging
 |   |-- mcp_server.py     MCP server over stdio, read-only unless replay is enabled
+|   |-- observability.py  Request IDs, access logging and log format
 |   |-- repositories/
 |   |   |-- __init__.py
 |   |   |-- events.py     EventRepository, the only place with event SQL
@@ -1125,6 +1170,7 @@ Behaviour worth knowing:
 |   |-- test_settings.py       Configuration parsing and validation tests
 |   |-- test_signatures.py     Signature parsing, verification and enforcement tests
 |   |-- test_limits.py         Body size cap and rate limit tests
+|   |-- test_observability.py  Request ID and access log tests
 |   |-- test_mcp_server.py     MCP tools, replay gating, approval hints and resource tests
 |   |-- test_persistence.py    API to database tests and restart behaviour
 |   |-- test_inspect_events.py Inspector tool tests
@@ -1156,7 +1202,7 @@ the problem, rather than silently falling back to a default.
 | `HOOKWATCH_DB_PATH` | `hookwatch.db` | both processes | SQLite database file. |
 | `HOOKWATCH_API_KEY` | unset | MCP | Operator key that enables `replay_event`. Unset, blank, unknown, revoked or viewer keys leave replay unavailable. Never a tool argument. |
 | `HOOKWATCH_ENGINE_ENABLED` | `true` | web | Start the in-process processing engine. |
-| `HOOKWATCH_LOG_LEVEL` | `INFO` | web | Root log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. |
+| `HOOKWATCH_LOG_LEVEL` | `INFO` | web | Root log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. Access lines are `INFO`; `/health` is `DEBUG`. |
 | `HOOKWATCH_WEBHOOK_SECRETS` | empty | web | `source=secret` pairs used to verify sender signatures. Required while enforcement is on. |
 | `HOOKWATCH_REQUIRE_SIGNATURES` | `true` | web | Require a valid signature for every delivery. True with no secrets stops startup. |
 | `HOOKWATCH_SIGNATURE_TOLERANCE_SECONDS` | `300` | web | Accepted difference between the signed timestamp and the server clock, 1 to 86400. |
@@ -1233,7 +1279,8 @@ exist:
   `Stripe-Signature` or `X-Hub-Signature-256`; HookWatch currently defines its
   own header
 - Retention, archival or cleanup of stored events
-- Operational metrics or dashboards
+- Operational metrics, dashboards, tracing or log shipping; logs are plain
+  key=value lines on stderr, and rotation belongs to the process manager
 - Other mutating tools over MCP beyond controlled replay
 - MCP transports other than stdio and resource subscriptions; MCP reads are not
   gated because the process already trusts local filesystem access, and only

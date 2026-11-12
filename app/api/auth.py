@@ -55,6 +55,11 @@ def get_principal(request: Request) -> Principal:
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Record the verified name for the access log. It comes from the key row,
+    # not from a header, so the line cannot be made to claim another principal.
+    # Set before the limit so a refused read still says who asked.
+    request.state.principal = principal.name
+
     # Limit after authentication, so a missing or invalid key is still a 401
     # rather than a 429 and cannot create a bucket. Keying by the row id rather
     # than the name means a revoked key that is reissued under the same name

@@ -19,6 +19,7 @@ from app.api.webhooks import log_validation_error
 from app.api.webhooks import router as webhooks_router
 from app.db import migrate
 from app.engine import run_forever
+from app.observability import RequestIdMiddleware, configure_logging
 from app.repositories.events import EventRepository
 from app.repositories.keys import KeyRepository
 from app.services.events import EventService
@@ -44,9 +45,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     config = settings or Settings.from_env()
 
     # uvicorn configures only its own loggers, so without this the application's
-    # INFO messages would be dropped silently. Structured logging is left to a
-    # later stage.
-    logging.basicConfig(level=config.log_level)
+    # INFO messages would be dropped silently. The format carries the request ID
+    # so handler lines can be correlated with the access line.
+    configure_logging(config.log_level)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -90,6 +91,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         BodySizeLimitMiddleware,
         max_bytes=config.max_body_bytes,
     )
+    # Added last so it is outermost: even a body rejected by the limit above gets
+    # an ID and an access line.
+    app.add_middleware(RequestIdMiddleware)
 
     app.include_router(webhooks_router)
     app.include_router(events_router)
