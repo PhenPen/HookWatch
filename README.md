@@ -32,9 +32,10 @@ running it.
 Stages are implemented one at a time, and each stage is committed separately.
 Stage 10 (production hardening) is in progress: the web process loads and
 validates its configuration from the environment before it starts, webhook
-deliveries are authenticated per source with HMAC-SHA256 signatures, and humans
-and agents authenticate with database-backed API keys that carry a role. A
-process that requires signatures without configuring a secret refuses to start.
+deliveries are authenticated per source with HMAC-SHA256 signatures, humans
+and agents authenticate with database-backed API keys that carry a role, and
+the HTTP layer caps request bodies and the rate one caller may send. A process
+that requires signatures without configuring a secret refuses to start.
 
 | Stage | Scope | Status |
 | --- | --- | --- |
@@ -48,7 +49,7 @@ process that requires signatures without configuring a secret refuses to start.
 | 7 | Monitoring and event replay | Complete |
 | 8 | MCP server | Complete |
 | 9 | AI agent integration | Complete |
-| 10 | Production hardening | In progress (configuration, sender signatures, API keys) |
+| 10 | Production hardening | In progress (configuration, sender signatures, API keys, HTTP limits) |
 
 ## Requirements
 
@@ -212,6 +213,52 @@ If `HOOKWATCH_REQUIRE_SIGNATURES=true` and no secret is configured, the process
 refuses to start. Set it to `false` for local work without signatures; a
 signature that is supplied is still verified in that mode, and a signed request
 for a source with no secret is still refused.
+
+## Limits
+
+Two controls bound what a single HTTP caller can consume. Both are policy
+values read at startup, and both can be disabled with `0` for local work.
+
+### Request body size
+
+`HOOKWATCH_MAX_BODY_BYTES` caps every request body, default 1 MiB. A larger
+body is answered with `413` and `{"detail": "request body too large"}`, the
+connection is closed, and nothing is parsed or stored. The cap is enforced from
+`Content-Length` when it is present and by counting the streamed bytes as well,
+so a missing header, chunked transfer or a lying length cannot bypass it.
+
+The body is buffered up to the cap and replayed to the route, so signature
+verification still sees the exact bytes the sender signed.
+
+### Rate limiting
+
+Reads are limited per API key and deliveries per source, using a token bucket:
+
+| Surface | Bucket | Default |
+| --- | --- | --- |
+| `GET /events`, `GET /events/{id}`, replay | `principal:<id>` | `HOOKWATCH_RATE_LIMIT_PER_MINUTE` = 600 |
+| `POST /webhooks/{source}` | `source:<name>` | `HOOKWATCH_WEBHOOK_RATE_LIMIT_PER_MINUTE` = 6000 |
+
+A refused request gets `429` with `{"detail": "rate limit exceeded"}` and a
+`Retry-After` header in seconds. It does not wait, because holding the
+connection is the resource the limit protects. Replay shares the key's read
+bucket, so it cannot be used to bypass the limit.
+
+The limits are in-process. Each web process has its own buckets, so running
+several workers multiplies the effective allowance. A shared limiter needs a
+store such as Redis, which this deployment deliberately does not run. `/health`
+is exempt.
+
+The webhook limit is checked before signature verification, so a flood costs
+one bucket lookup instead of an HMAC per request. The trade-off is that forged
+deliveries consume the real source's allowance. Unauthenticated reads are not
+rate-limited: a missing or invalid key is answered `401` without creating a
+bucket, and per-IP limiting belongs with the proxy and deployment work.
+
+`429` can be retried after `Retry-After`; `413` requires a smaller payload.
+Neither status says whether the caller is authenticated: a delivery can be
+refused before its signature is checked, and a read can be refused after a
+valid key is recognized.
 
 ## Inspecting events
 
@@ -950,16 +997,24 @@ default.
 uv run pytest
 ```
 
-The API test fixtures build an explicit `Settings` with `engine_enabled=False`
-and `require_signatures=False`, so no test depends on the environment and
-assertions about the initial `received` state are deterministic. Engine tests
-enable processing explicitly; the signature suite enables enforcement and signs
-every delivery.
+The API test fixtures build an explicit `Settings` with `engine_enabled=False`,
+`require_signatures=False` and both rate limits set to `0`, so no test depends on
+the environment and assertions about the initial `received` state are
+deterministic. Engine tests enable processing explicitly; the signature suite
+enables enforcement and signs every delivery; the limits suite builds its own app
+and turns the limits on.
 
 `tests/test_settings.py` covers environment parsing, boolean spellings, blank
 values falling back to defaults, rejected values, webhook secret parsing and
-validation, tolerance bounds, and the rule that webhook secrets never appear in
-the settings repr.
+validation, tolerance bounds, HTTP limit bounds, and the rule that webhook
+secrets never appear in the settings repr.
+
+`tests/test_limits.py` covers the token bucket with a hand-moved clock, token
+refill, independent buckets, the bucket map cap, concurrent checks, and the
+denial log rate. It also drives the middleware directly for declared and
+streamed bodies, exact replay and disconnects, and through the API for `413`,
+`429`, `Retry-After`, per-key and per-source isolation, the `401` before `429`
+order, and the `/health` exemption.
 
 `tests/test_signatures.py` covers valid deliveries, wrong secrets, tampered
 bodies, stale and future timestamps, malformed headers, unconfigured sources,
@@ -1016,7 +1071,7 @@ Behaviour worth knowing:
   delivery rather than the business event, and an event may legitimately arrive
   late. Enforcing `occurred_at` freshness would be a separate policy.
 - No payload size limit is applied at this layer. That belongs to the HTTP
-  receiver.
+  receiver, which caps the raw body before it is parsed as JSON.
 
 ## Project layout
 
@@ -1029,6 +1084,7 @@ Behaviour worth knowing:
 |   |   |-- auth.py       Bearer key authentication and role checks
 |   |   |-- deps.py       Shared route dependencies
 |   |   |-- events.py     Inspection, filtering and replay endpoints
+|   |   |-- limits.py     Body size cap and per-caller token bucket
 |   |   |-- signatures.py   HMAC parsing and verification for deliveries
 |   |   `-- webhooks.py   Webhook receiver endpoint and error logging
 |   |-- db.py             Connections, migrations and row models
@@ -1068,6 +1124,7 @@ Behaviour worth knowing:
 |   |-- test_keys.py           Key issuance, rotation, revocation and hashing tests
 |   |-- test_settings.py       Configuration parsing and validation tests
 |   |-- test_signatures.py     Signature parsing, verification and enforcement tests
+|   |-- test_limits.py         Body size cap and rate limit tests
 |   |-- test_mcp_server.py     MCP tools, replay gating, approval hints and resource tests
 |   |-- test_persistence.py    API to database tests and restart behaviour
 |   |-- test_inspect_events.py Inspector tool tests
@@ -1103,6 +1160,9 @@ the problem, rather than silently falling back to a default.
 | `HOOKWATCH_WEBHOOK_SECRETS` | empty | web | `source=secret` pairs used to verify sender signatures. Required while enforcement is on. |
 | `HOOKWATCH_REQUIRE_SIGNATURES` | `true` | web | Require a valid signature for every delivery. True with no secrets stops startup. |
 | `HOOKWATCH_SIGNATURE_TOLERANCE_SECONDS` | `300` | web | Accepted difference between the signed timestamp and the server clock, 1 to 86400. |
+| `HOOKWATCH_MAX_BODY_BYTES` | `1048576` | web | Largest accepted request body in bytes, 0 to 64 MiB. `0` disables the cap. |
+| `HOOKWATCH_RATE_LIMIT_PER_MINUTE` | `600` | web | Authenticated reads allowed per principal per minute, 0 to 1,000,000. `0` disables the limit. |
+| `HOOKWATCH_WEBHOOK_RATE_LIMIT_PER_MINUTE` | `6000` | web | Deliveries allowed per source per minute, 0 to 1,000,000. `0` disables the limit. |
 | `HOOKWATCH_POLL_INTERVAL_SECONDS` | `1.0` | web | Wait before the next pass when nothing was due. |
 | `HOOKWATCH_BATCH_SIZE` | `10` | web | Maximum events examined per pass. |
 | `HOOKWATCH_MAX_ATTEMPTS` | `5` | web | Attempts per replay cycle before an event is dead-lettered. |
@@ -1114,7 +1174,8 @@ Booleans accept `true`, `false`, `1`, `0`, `yes`, `no`, `on` and `off`,
 case-insensitive. Blank values fall back to the default. Numeric values must be
 finite; `nan` and `inf` are rejected, as are zero or negative intervals, a zero
 batch size, zero attempts, a backoff cap below the base, and a signature
-tolerance outside 1 to 86400 seconds.
+tolerance outside 1 to 86400 seconds. The HTTP limits accept zero, which disables
+them, but reject negative numbers, booleans and values above their cap.
 
 `HOOKWATCH_WEBHOOK_SECRETS` is a comma-separated list of `source=secret` pairs.
 Each pair is split at the first `=`, so a secret may contain one. Source names
@@ -1141,6 +1202,10 @@ redundant. Choose one shape:
 - several workers, plus one process with `HOOKWATCH_ENGINE_ENABLED=true` and the
   rest with it set to `false`.
 
+Rate limits are per process, so every extra worker adds another full allowance.
+If the deployment needs one shared budget, the limiter would have to move behind
+a shared store, which this one-process design deliberately avoids.
+
 Configuration is read once at startup. Changing an environment variable requires
 a restart; there is no config file and no reload at runtime.
 
@@ -1162,8 +1227,8 @@ exist:
   principal, not a person
 - Key expiry, per-key scopes and an HTTP admin API for key management; only the
   CLI manages keys
-- Rate limiting at the HTTP layer
-- Payload size limits at the HTTP layer
+- Per-IP rate limiting and shared rate limits across workers; limits are per
+  principal or source, in process
 - Per-source adapters for third-party signature formats such as
   `Stripe-Signature` or `X-Hub-Signature-256`; HookWatch currently defines its
   own header

@@ -9,6 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.api.deps import get_event_service
+from app.api.limits import enforce_rate_limit
 from app.api.signatures import (
     SIGNATURE_HEADER,
     SignatureError,
@@ -63,8 +64,17 @@ async def require_signed_delivery(
     With enforcement on, an unconfigured source is refused as well. The source
     name comes from an attacker-controlled path, so accepting an unlisted one
     would let a sender bypass signatures entirely by picking a new name.
+
+    The rate limit runs first, so a flood is refused before any signature work.
+    The trade-off is that forged deliveries consume the same per-source budget
+    as real ones: a source's own allowance is the cost of bounding the HMAC work
+    without a second per-IP tier.
     """
     config: Settings = request.app.state.config
+    enforce_rate_limit(
+        request.app.state.webhook_limits,
+        f"source:{source}",
+    )
     header = request.headers.get(SIGNATURE_HEADER)
     secret = config.webhook_secrets.get(source)
 

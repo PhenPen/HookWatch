@@ -25,11 +25,16 @@ def settings(database_path: Path) -> Settings:
     Signature enforcement is disabled here because most tests are about the
     event lifecycle, not about sender authentication. The signature suite turns
     it on explicitly and signs every delivery.
+
+    Rate limits are disabled for the same reason: most tests care about
+    behaviour, not load. The limit suite builds its own app and turns them on.
     """
     return Settings(
         database_path=database_path,
         engine_enabled=False,
         require_signatures=False,
+        rate_limit_per_minute=0,
+        webhook_rate_limit_per_minute=0,
     )
 
 

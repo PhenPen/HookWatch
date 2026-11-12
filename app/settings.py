@@ -11,6 +11,10 @@ algorithm and header name are protocol constants and deliberately stay in
 `app.api.signatures`, because a configurable protocol would let the sender and
 the receiver disagree silently.
 
+HTTP abuse limits are policy as well: the largest accepted body and the
+per-minute allowance for reads and deliveries. The token bucket and the 413 and
+429 responses stay in `app.api.limits`; only the numbers are configurable.
+
 The MCP process reads its own variables in `app.mcp_server`; it does not need
 the webhook or processing settings below.
 """
@@ -27,6 +31,11 @@ DEFAULT_DATABASE_PATH = Path("hookwatch.db")
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_SIGNATURE_TOLERANCE_SECONDS = 300
 MAX_SIGNATURE_TOLERANCE_SECONDS = 86400
+DEFAULT_MAX_BODY_BYTES = 1024 * 1024
+MAX_BODY_BYTES = 64 * 1024 * 1024
+DEFAULT_RATE_LIMIT_PER_MINUTE = 600
+DEFAULT_WEBHOOK_RATE_LIMIT_PER_MINUTE = 6000
+MAX_RATE_LIMIT_PER_MINUTE = 1_000_000
 LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 FALSE_VALUES = frozenset({"0", "false", "no", "off"})
@@ -139,6 +148,9 @@ class Settings:
     webhook_secrets: dict[str, str] = field(default_factory=dict, repr=False)
     require_signatures: bool = True
     signature_tolerance_seconds: int = DEFAULT_SIGNATURE_TOLERANCE_SECONDS
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
+    rate_limit_per_minute: int = DEFAULT_RATE_LIMIT_PER_MINUTE
+    webhook_rate_limit_per_minute: int = DEFAULT_WEBHOOK_RATE_LIMIT_PER_MINUTE
     processing: ProcessingSettings = field(default_factory=ProcessingSettings)
 
     def __post_init__(self) -> None:
@@ -177,6 +189,26 @@ class Settings:
                 "signature_tolerance_seconds must be at most "
                 f"{MAX_SIGNATURE_TOLERANCE_SECONDS}"
             )
+
+        for name, value, maximum in (
+            ("max_body_bytes", self.max_body_bytes, MAX_BODY_BYTES),
+            (
+                "rate_limit_per_minute",
+                self.rate_limit_per_minute,
+                MAX_RATE_LIMIT_PER_MINUTE,
+            ),
+            (
+                "webhook_rate_limit_per_minute",
+                self.webhook_rate_limit_per_minute,
+                MAX_RATE_LIMIT_PER_MINUTE,
+            ),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+            if value < 0:
+                raise ValueError(f"{name} must be at least 0")
+            if value > maximum:
+                raise ValueError(f"{name} must be at most {maximum}")
 
         processing = self.processing
         if processing.batch_size < 1:
@@ -244,6 +276,18 @@ class Settings:
                 signature_tolerance_seconds=_integer(
                     "HOOKWATCH_SIGNATURE_TOLERANCE_SECONDS",
                     DEFAULT_SIGNATURE_TOLERANCE_SECONDS,
+                ),
+                max_body_bytes=_integer(
+                    "HOOKWATCH_MAX_BODY_BYTES",
+                    DEFAULT_MAX_BODY_BYTES,
+                ),
+                rate_limit_per_minute=_integer(
+                    "HOOKWATCH_RATE_LIMIT_PER_MINUTE",
+                    DEFAULT_RATE_LIMIT_PER_MINUTE,
+                ),
+                webhook_rate_limit_per_minute=_integer(
+                    "HOOKWATCH_WEBHOOK_RATE_LIMIT_PER_MINUTE",
+                    DEFAULT_WEBHOOK_RATE_LIMIT_PER_MINUTE,
                 ),
                 processing=ProcessingSettings(
                     poll_interval_seconds=_number(

@@ -243,6 +243,8 @@ def replay_app(database_path: Path):
             database_path=database_path,
             engine_enabled=False,
             require_signatures=False,
+            rate_limit_per_minute=0,
+            webhook_rate_limit_per_minute=0,
         )
     )
 

@@ -3,7 +3,12 @@ from pathlib import Path
 import pytest
 
 from app.services.events import ProcessingSettings
-from app.settings import Settings, parse_webhook_secrets
+from app.settings import (
+    MAX_BODY_BYTES,
+    MAX_RATE_LIMIT_PER_MINUTE,
+    Settings,
+    parse_webhook_secrets,
+)
 
 VARIABLES = (
     "HOOKWATCH_DB_PATH",
@@ -12,6 +17,9 @@ VARIABLES = (
     "HOOKWATCH_WEBHOOK_SECRETS",
     "HOOKWATCH_REQUIRE_SIGNATURES",
     "HOOKWATCH_SIGNATURE_TOLERANCE_SECONDS",
+    "HOOKWATCH_MAX_BODY_BYTES",
+    "HOOKWATCH_RATE_LIMIT_PER_MINUTE",
+    "HOOKWATCH_WEBHOOK_RATE_LIMIT_PER_MINUTE",
     "HOOKWATCH_POLL_INTERVAL_SECONDS",
     "HOOKWATCH_BATCH_SIZE",
     "HOOKWATCH_MAX_ATTEMPTS",
@@ -37,6 +45,9 @@ def test_defaults_match_the_code_defaults() -> None:
     assert settings.webhook_secrets == {}
     assert settings.require_signatures is True
     assert settings.signature_tolerance_seconds == 300
+    assert settings.max_body_bytes == 1024 * 1024
+    assert settings.rate_limit_per_minute == 600
+    assert settings.webhook_rate_limit_per_minute == 6000
     assert settings.processing == ProcessingSettings()
 
 
@@ -58,6 +69,9 @@ def test_reads_every_variable(
     )
     monkeypatch.setenv("HOOKWATCH_REQUIRE_SIGNATURES", "true")
     monkeypatch.setenv("HOOKWATCH_SIGNATURE_TOLERANCE_SECONDS", "120")
+    monkeypatch.setenv("HOOKWATCH_MAX_BODY_BYTES", "2048")
+    monkeypatch.setenv("HOOKWATCH_RATE_LIMIT_PER_MINUTE", "12")
+    monkeypatch.setenv("HOOKWATCH_WEBHOOK_RATE_LIMIT_PER_MINUTE", "34")
     monkeypatch.setenv("HOOKWATCH_POLL_INTERVAL_SECONDS", "0.5")
     monkeypatch.setenv("HOOKWATCH_BATCH_SIZE", "3")
     monkeypatch.setenv("HOOKWATCH_MAX_ATTEMPTS", "7")
@@ -73,6 +87,9 @@ def test_reads_every_variable(
     assert settings.webhook_secrets == {"github": "one", "stripe": "two"}
     assert settings.require_signatures is True
     assert settings.signature_tolerance_seconds == 120
+    assert settings.max_body_bytes == 2048
+    assert settings.rate_limit_per_minute == 12
+    assert settings.webhook_rate_limit_per_minute == 34
     assert settings.processing.poll_interval_seconds == 0.5
     assert settings.processing.batch_size == 3
     assert settings.processing.max_attempts == 7
@@ -127,6 +144,9 @@ def test_blank_variables_fall_back_to_defaults(
     assert settings.webhook_secrets == {}
     assert settings.require_signatures is True
     assert settings.signature_tolerance_seconds == 300
+    assert settings.max_body_bytes == 1024 * 1024
+    assert settings.rate_limit_per_minute == 600
+    assert settings.webhook_rate_limit_per_minute == 6000
     assert settings.processing == ProcessingSettings()
 
 
@@ -143,6 +163,13 @@ def test_blank_variables_fall_back_to_defaults(
         (
             "HOOKWATCH_SIGNATURE_TOLERANCE_SECONDS",
             "soon",
+            "must be an integer",
+        ),
+        ("HOOKWATCH_MAX_BODY_BYTES", "big", "must be an integer"),
+        ("HOOKWATCH_RATE_LIMIT_PER_MINUTE", "fast", "must be an integer"),
+        (
+            "HOOKWATCH_WEBHOOK_RATE_LIMIT_PER_MINUTE",
+            "often",
             "must be an integer",
         ),
         ("HOOKWATCH_WEBHOOK_SECRETS", "github", "source=secret"),
@@ -265,6 +292,57 @@ def test_acceptable_tolerances_are_kept(tolerance: int) -> None:
     )
 
     assert settings.signature_tolerance_seconds == tolerance
+
+
+def test_http_limits_can_be_disabled() -> None:
+    settings = Settings(
+        max_body_bytes=0,
+        rate_limit_per_minute=0,
+        webhook_rate_limit_per_minute=0,
+    )
+
+    assert settings.max_body_bytes == 0
+    assert settings.rate_limit_per_minute == 0
+    assert settings.webhook_rate_limit_per_minute == 0
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_body_bytes",
+        "rate_limit_per_minute",
+        "webhook_rate_limit_per_minute",
+    ],
+)
+def test_negative_http_limits_are_rejected(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        Settings(**{field: -1})
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_body_bytes",
+        "rate_limit_per_minute",
+        "webhook_rate_limit_per_minute",
+    ],
+)
+def test_boolean_http_limits_are_rejected(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        Settings(**{field: True})
+
+
+def test_absurd_http_limits_are_rejected() -> None:
+    with pytest.raises(ValueError, match="max_body_bytes"):
+        Settings(max_body_bytes=MAX_BODY_BYTES + 1)
+
+    with pytest.raises(ValueError, match="rate_limit_per_minute"):
+        Settings(rate_limit_per_minute=MAX_RATE_LIMIT_PER_MINUTE + 1)
+
+    with pytest.raises(ValueError, match="webhook_rate_limit_per_minute"):
+        Settings(
+            webhook_rate_limit_per_minute=MAX_RATE_LIMIT_PER_MINUTE + 1
+        )
 
 
 def test_enforcement_passes_with_a_secret() -> None:

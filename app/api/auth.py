@@ -15,6 +15,7 @@ from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
 
+from app.api.limits import enforce_rate_limit
 from app.db import Principal, Role
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,15 @@ def get_principal(request: Request) -> Principal:
             detail="invalid or missing API key",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    # Limit after authentication, so a missing or invalid key is still a 401
+    # rather than a 429 and cannot create a bucket. Keying by the row id rather
+    # than the name means a revoked key that is reissued under the same name
+    # starts with a fresh allowance.
+    enforce_rate_limit(
+        request.app.state.read_limits,
+        f"principal:{principal.id}",
+    )
 
     return principal
 

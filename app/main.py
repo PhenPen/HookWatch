@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 
 from app.api.events import router as events_router
+from app.api.limits import BodySizeLimitMiddleware, RateLimiter
 from app.api.webhooks import log_validation_error
 from app.api.webhooks import router as webhooks_router
 from app.db import migrate
@@ -67,6 +68,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.keys = keys
         app.state.config = config
         app.state.processing = config.processing
+        app.state.read_limits = RateLimiter(config.rate_limit_per_minute)
+        app.state.webhook_limits = RateLimiter(
+            config.webhook_rate_limit_per_minute
+        )
 
         stop = asyncio.Event()
         engine_task: asyncio.Task[None] | None = None
@@ -81,6 +86,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await engine_task
 
     app = FastAPI(title="HookWatch", lifespan=lifespan)
+    app.add_middleware(
+        BodySizeLimitMiddleware,
+        max_bytes=config.max_body_bytes,
+    )
 
     app.include_router(webhooks_router)
     app.include_router(events_router)
