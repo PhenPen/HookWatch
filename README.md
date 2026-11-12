@@ -34,9 +34,10 @@ Stage 10 (production hardening) is in progress: the web process loads and
 validates its configuration from the environment before it starts, webhook
 deliveries are authenticated per source with HMAC-SHA256 signatures, humans
 and agents authenticate with database-backed API keys that carry a role, the
-HTTP layer caps request bodies and the rate one caller may send, and every
-request gets an ID that appears in its access line and handler logs. A process
-that requires signatures without configuring a secret refuses to start.
+HTTP layer caps request bodies and the rate one caller may send, every request
+gets an ID that appears in its access line and handler logs, and the database
+can be backed up, verified and restored from the command line. A process that
+requires signatures without configuring a secret refuses to start.
 
 | Stage | Scope | Status |
 | --- | --- | --- |
@@ -50,7 +51,7 @@ that requires signatures without configuring a secret refuses to start.
 | 7 | Monitoring and event replay | Complete |
 | 8 | MCP server | Complete |
 | 9 | AI agent integration | Complete |
-| 10 | Production hardening | In progress (configuration, sender signatures, API keys, HTTP limits, observability) |
+| 10 | Production hardening | In progress (configuration, sender signatures, API keys, HTTP limits, observability, backup and recovery) |
 
 ## Requirements
 
@@ -865,6 +866,65 @@ Known limits at this stage:
   connection or a table name, so replacing SQLite later means rewriting one
   class.
 
+## Backup and recovery
+
+The database holds the queue, attempts, replay history and hashed keys, so it is
+the only copy of that state. Copying the file while the server is running can
+produce a torn backup: SQLite may be part-way through a write, and a plain copy
+does not include the journal. The backup tool uses SQLite's online backup API
+instead, so it reads a consistent snapshot while the server keeps serving.
+
+### Create
+
+```shell
+uv run python -m tools.backup_db create --db hookwatch.db
+uv run python -m tools.backup_db create --db hookwatch.db --output backups/hw.db
+```
+
+The default output sits next to the database and is named
+`hookwatch-backup-<UTC timestamp>.db`. The tool writes to a temporary file, runs
+`PRAGMA integrity_check` and `PRAGMA foreign_key_check` on the copy, and only
+then renames it into place. A failure leaves no half-written backup. An existing
+output is refused unless `--force` is passed.
+
+It prints one JSON object:
+
+```json
+{"database": "hookwatch.db", "backup": "hookwatch-backup-20261112T120000Z.db", "bytes": 24576, "schema_version": 6, "events": 42, "integrity": "ok", "foreign_keys": "ok"}
+```
+
+### Verify
+
+```shell
+uv run python -m tools.backup_db verify --db hookwatch-backup-20261112T120000Z.db
+```
+
+Verification opens the file read-only, checks integrity and foreign keys, and
+reports the schema version and event count. Run it before restoring, or as a
+periodic check that a backup is still readable. It does not modify the file.
+
+### Restore
+
+```shell
+uv run python -m tools.backup_db restore --db hookwatch.db --backup hookwatch-backup-20261112T120000Z.db --force
+```
+
+Stop the web process and the engine first. Restore verifies the backup before
+anything is replaced, refuses when a `-journal`, `-wal` or `-shm` sidecar exists,
+and requires `--force` when the target already exists. The replaced database is
+kept next to the target as `hookwatch.db.before-restore-<UTC timestamp>`, so a
+wrong restore can be undone by stopping the server and moving it back. If the
+copy fails, the original is put back.
+
+An older backup is migrated on the next startup, like any older database. A
+backup from a newer schema is still valid but warns: restore it with the release
+that wrote it. Backups contain event payloads and hashed operator keys, so treat
+them as sensitive and protect them like the database itself.
+
+The tool creates one backup per invocation. Scheduling and rotation belong to
+the platform, for example a cron job or Windows Task Scheduler entry that calls
+`create` and removes old files. There is no retention policy in HookWatch.
+
 ## Processing engine
 
 The engine is one asyncio task started during the FastAPI lifespan. It asks the
@@ -1073,6 +1133,13 @@ malformed, unknown and revoked keys get `401`, a viewer can read but not replay,
 and rotation takes effect immediately. `tests/test_manage_keys.py` exercises the
 CLI, including an old database that gains the new table.
 
+`tests/test_backup.py` covers a verified backup, default naming, independence
+from later writes, refusal to overwrite without `--force`, forced replacement,
+missing and non-HookWatch databases, partial-file cleanup, verification without
+modifying the file, corrupt files, restore to a new path, forced restore with the
+previous file kept, corrupt backups, journal sidecars and the newer-schema
+warning.
+
 The MCP tests use the SDK's in-memory client against a temporary seeded
 database. They cover tool discovery, structured results, filtering, paging,
 unknown ids, invalid arguments, the processing history view and resource reads.
@@ -1174,11 +1241,13 @@ Behaviour worth knowing:
 |   |-- test_mcp_server.py     MCP tools, replay gating, approval hints and resource tests
 |   |-- test_persistence.py    API to database tests and restart behaviour
 |   |-- test_inspect_events.py Inspector tool tests
-|   `-- test_manage_keys.py    Key management CLI tests
+|   |-- test_manage_keys.py    Key management CLI tests
+|   `-- test_backup.py         Backup, verification and restore tests
 |-- tools/
 |   |-- simulate_webhook.py    Development tool that sends simulated events
 |   |-- inspect_events.py      Development tool that prints stored events
-|   `-- manage_keys.py         Development tool that issues and revokes API keys
+|   |-- manage_keys.py         Development tool that issues and revokes API keys
+|   `-- backup_db.py           Development tool that backs up, verifies and restores the database
 |-- pyproject.toml        Project metadata, dependencies, pytest configuration
 |-- uv.lock               Reproducible dependency lock file
 |-- .python-version       Python version selected by uv
@@ -1279,6 +1348,8 @@ exist:
   `Stripe-Signature` or `X-Hub-Signature-256`; HookWatch currently defines its
   own header
 - Retention, archival or cleanup of stored events
+- Scheduled backups or backup rotation; the CLI creates one file per invocation
+  and keeps every file it is given
 - Operational metrics, dashboards, tracing or log shipping; logs are plain
   key=value lines on stderr, and rotation belongs to the process manager
 - Other mutating tools over MCP beyond controlled replay
